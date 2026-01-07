@@ -1,0 +1,15 @@
+name = "PX4ULog"
+uuid = "f9a4f512-fe73-430d-b50d-a67499c1e6e0"
+version = "0.1.0"
+authors = ["Carl"]
+
+[deps]
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+
+[extensions]
+PX4ULogDataFramesExt = "DataFrames"
+
+[compat]
+DataFrames = "1.8"
+julia = "1.12"
