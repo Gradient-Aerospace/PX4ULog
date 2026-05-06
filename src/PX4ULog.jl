@@ -51,10 +51,16 @@ struct ULogMessage
     payload::Vector{UInt8}
 end
 
+struct FlagBits
+    compat_flags::NTuple{8,UInt8}
+    incompat_flags::NTuple{8,UInt8}
+    appended_offsets::NTuple{3,UInt64}
+end
+
 """
 Field definition from a FORMAT message.
 - `name`: field name
-- `ulog_type`: primitive token (e.g. "uint64_t", "float", "bool", "char")
+- `ulog_type`: primitive token or nested format name
 - `array_len`: 0 = scalar, >0 = fixed array
 """
 struct FieldDef
@@ -98,6 +104,14 @@ end
     return UInt16(b1) | (UInt16(b2) << 8)
 end
 
+@inline function read_u64_le(bytes::Vector{UInt8}, i::Int)::UInt64
+    x = UInt64(0)
+    @inbounds for k in 0:7
+        x |= UInt64(bytes[i+k]) << (8*k)
+    end
+    return x
+end
+
 # Best-effort ASCII rendering for debug output
 function ascii_type(t::UInt8)::Char
     c = Char(t)
@@ -128,37 +142,104 @@ function read_ulog_header(io::IO)::ULogHeader
     return ULogHeader(magic_ok, version, ts, raw)
 end
 
+function validate_ulog_header(hdr::ULogHeader)
+    hdr.magic_ok || error("Invalid ULog magic bytes")
+    return nothing
+end
+
+function decode_flag_bits(msg::ULogMessage)::FlagBits
+    msg.type == UInt8('B') || error("decode_flag_bits: expected 'B', got $(Char(msg.type))")
+    length(msg.payload) == 40 || error("FLAG_BITS payload has $(length(msg.payload)) bytes, expected 40")
+
+    p = msg.payload
+    compat_flags = ntuple(i -> p[i], 8)
+    incompat_flags = ntuple(i -> p[8+i], 8)
+    appended_offsets = ntuple(i -> read_u64_le(p, 17 + 8*(i-1)), 3)
+
+    return FlagBits(compat_flags, incompat_flags, appended_offsets)
+end
+
+function validate_flag_bits(flags::FlagBits)
+    unsupported_first = flags.incompat_flags[1] & 0xfe
+    if unsupported_first != 0x00 || any(!iszero, flags.incompat_flags[2:end])
+        bytes = join(("0x" * string(f; base=16, pad=2) for f in flags.incompat_flags), ", ")
+        error("Unsupported ULog incompatibility flags: [$bytes]")
+    end
+    if (flags.incompat_flags[1] & 0x01) != 0x00 && any(!iszero, flags.appended_offsets)
+        error("ULog appended data is not supported")
+    end
+    return nothing
+end
+
+function read_ulog_preamble!(io::IO)::Tuple{ULogHeader, FlagBits}
+    hdr = read_ulog_header(io)
+    validate_ulog_header(hdr)
+
+    msg = read_message_at!(io)
+    msg.type == UInt8('B') || error("Expected ULog flag-bits message ('B') immediately after header")
+    flags = decode_flag_bits(msg)
+    validate_flag_bits(flags)
+
+    return hdr, flags
+end
+
 # -----------------------------------------------------------------------------
 # Message iteration
 # -----------------------------------------------------------------------------
 
-"""
-Iterate ULog messages from the current IO position.
+function read_message_or_nothing!(io::IO)::Union{ULogMessage, Nothing}
+    eof(io) && return nothing
+    offset = position(io)
 
-We interpret msg_size as the number of bytes in payload following msg_type.
-This matches the behavior you validated on your .ulg.
+    b1 = try
+        read(io, UInt8)
+    catch e
+        if e isa EOFError
+            return nothing
+        else
+            rethrow()
+        end
+    end
+    b2 = try
+        read(io, UInt8)
+    catch e
+        if e isa EOFError
+            return nothing
+        else
+            rethrow()
+        end
+    end
+    msg_size = UInt16(b1) | (UInt16(b2) << 8)
+
+    msg_type = try
+        read(io, UInt8)
+    catch e
+        if e isa EOFError
+            return nothing
+        else
+            rethrow()
+        end
+    end
+
+    payload_len = Int(msg_size)
+    payload = payload_len == 0 ? UInt8[] : read(io, payload_len)
+    length(payload) == payload_len || return nothing
+
+    return ULogMessage(offset, msg_size, msg_type, payload)
+end
+
+"""
+Iterate complete ULog messages from the current IO position.
+
+`msg_size` is interpreted as the number of payload bytes following `msg_type`.
+If the file ends in the middle of a message, the partial message is discarded.
 """
 function each_message(io::IO)
     return Channel{ULogMessage}(32) do ch
-        while !eof(io)
-            offset = position(io)
-
-            msg_size = try
-                read_u16_le(io)
-            catch e
-                if e isa EOFError
-                    break
-                else
-                    rethrow()
-                end
-            end
-
-            msg_type = read_u8(io)
-
-            payload_len = Int(msg_size)
-            payload = payload_len == 0 ? UInt8[] : read(io, payload_len)
-
-            put!(ch, ULogMessage(offset, msg_size, msg_type, payload))
+        while true
+            msg = read_message_or_nothing!(io)
+            msg === nothing && break
+            put!(ch, msg)
         end
     end
 end
@@ -169,10 +250,9 @@ Assumes position(io) is at the start of the message header (msg_size field).
 """
 function read_message_at!(io::IO)::ULogMessage
     offset = position(io)
-    msg_size = read_u16_le(io)
-    msg_type = read_u8(io)
-    payload = msg_size == 0 ? UInt8[] : read(io, Int(msg_size))
-    return ULogMessage(offset, msg_size, msg_type, payload)
+    msg = read_message_or_nothing!(io)
+    msg === nothing && error("Truncated ULog message at offset $offset")
+    return msg
 end
 
 # -----------------------------------------------------------------------------
@@ -280,7 +360,7 @@ end
 
 function read_all_formats(path::AbstractString)
     open(path, "r") do io
-        _ = read_ulog_header(io)
+        _ = read_ulog_preamble!(io)
         formats = Dict{String, FormatDef}()
 
         for msg in each_message(io)
@@ -297,7 +377,7 @@ end
 
 function scan_formats(path::AbstractString; max_formats::Int=20)
     open(path, "r") do io
-        _ = read_ulog_header(io)
+        _ = read_ulog_preamble!(io)
 
         n = 0
         for msg in each_message(io)
@@ -345,7 +425,7 @@ end
 
 function read_all_subscriptions(path::AbstractString)
     open(path, "r") do io
-        _ = read_ulog_header(io)
+        _ = read_ulog_preamble!(io)
 
         subs_by_id = Dict{UInt16, Subscription}()
         subs_by_name = Dict{Tuple{String,UInt8}, UInt16}()
@@ -364,7 +444,7 @@ end
 
 function scan_subscriptions(path::AbstractString; max_subs::Int=30)
     open(path, "r") do io
-        _ = read_ulog_header(io)
+        _ = read_ulog_preamble!(io)
         n = 0
         for msg in each_message(io)
             if msg.type == UInt8('A')
@@ -384,7 +464,7 @@ end
 # Primitive types + little-endian loads
 # -----------------------------------------------------------------------------
 
-function ulog_primitive(t::AbstractString)
+function primitive_info(t::AbstractString)
     s = String(strip(t))
     if s == "int8_t";   return (Int8,   1) end
     if s == "uint8_t";  return (UInt8,  1) end
@@ -398,7 +478,339 @@ function ulog_primitive(t::AbstractString)
     if s == "double";   return (Float64, 8) end
     if s == "bool";     return (Bool,   1) end
     if s == "char";     return (UInt8,  1) end
-    error("Unsupported/unknown ULog primitive type: '$s'")
+    return nothing
+end
+
+function ulog_primitive(t::AbstractString)
+    info = primitive_info(t)
+    info === nothing && error("Unsupported/unknown ULog primitive type: '$(strip(t))'")
+    return info
+end
+
+is_padding(f::FieldDef) = startswith(String(f.name), "_padding")
+field_count(f::FieldDef) = f.array_len == 0 ? 1 : f.array_len
+
+function format_lookup(formats::Dict{String, FormatDef}, name::AbstractString)::FormatDef
+    key = String(name)
+    haskey(formats, key) || error("Unknown nested ULog format: '$key'")
+    return formats[key]
+end
+
+function prefixed_name(prefix::AbstractString, name::Symbol)::Symbol
+    isempty(prefix) && return name
+    return Symbol(prefix, "_", name)
+end
+
+function child_prefix(prefix::AbstractString, name::Symbol)::String
+    isempty(prefix) && return String(name)
+    return string(prefix, "_", name)
+end
+
+function insert_column!(cols::Dict{Symbol, Any}, name::Symbol, col)
+    haskey(cols, name) && error("Duplicate decoded column name: $name")
+    cols[name] = col
+    return nothing
+end
+
+function format_serialized_bytes(
+    fmt::FormatDef,
+    formats::Dict{String, FormatDef};
+    omit_final_padding::Bool,
+    stack::Vector{String}=String[],
+)::Int
+    if fmt.name in stack
+        cycle = join([stack; fmt.name], " -> ")
+        error("Circular ULog FORMAT definition: $cycle")
+    end
+
+    push!(stack, fmt.name)
+    total = 0
+    for (idx, f) in enumerate(fmt.fields)
+        if is_padding(f) && omit_final_padding && idx == lastindex(fmt.fields)
+            continue
+        end
+
+        n = field_count(f)
+        info = primitive_info(f.ulog_type)
+        if info === nothing
+            nested = format_lookup(formats, f.ulog_type)
+            total += n * format_serialized_bytes(
+                nested,
+                formats;
+                omit_final_padding=false,
+                stack=stack,
+            )
+        else
+            (_, sz) = info
+            total += sz * n
+        end
+    end
+    pop!(stack)
+    return total
+end
+
+function expected_struct_bytes(fmt::FormatDef, formats::Dict{String, FormatDef})::Int
+    return format_serialized_bytes(fmt, formats; omit_final_padding=true)
+end
+
+function expected_struct_bytes(fmt::FormatDef)::Int
+    return expected_struct_bytes(fmt, Dict{String, FormatDef}())
+end
+
+function full_struct_bytes(fmt::FormatDef, formats::Dict{String, FormatDef})::Int
+    return format_serialized_bytes(fmt, formats; omit_final_padding=false)
+end
+
+function final_padding_omitted(
+    struct_len::Int,
+    expected_omitted::Int,
+    expected_full::Int,
+    topic_name::AbstractString,
+    payload_len::Int,
+)::Bool
+    if struct_len == expected_omitted
+        return true
+    elseif struct_len == expected_full
+        return false
+    end
+
+    if expected_omitted == expected_full
+        error("Unexpected struct length for topic=$(topic_name): got $struct_len bytes, expected $expected_omitted. DATA payload len=$(payload_len)")
+    else
+        error("Unexpected struct length for topic=$(topic_name): got $struct_len bytes, expected $expected_omitted without final padding or $expected_full with final padding. DATA payload len=$(payload_len)")
+    end
+end
+
+function init_columns_for_format!(
+    cols::Dict{Symbol, Any},
+    fmt::FormatDef,
+    formats::Dict{String, FormatDef},
+    N::Int;
+    prefix::String="",
+    repetitions::Int=1,
+    top_level::Bool=false,
+)::Bool
+    has_ts = false
+
+    for f in fmt.fields
+        is_padding(f) && continue
+
+        info = primitive_info(f.ulog_type)
+        if info === nothing
+            nested = format_lookup(formats, f.ulog_type)
+            child_has_ts = init_columns_for_format!(
+                cols,
+                nested,
+                formats,
+                N;
+                prefix=child_prefix(prefix, f.name),
+                repetitions=repetitions * field_count(f),
+                top_level=false,
+            )
+            has_ts |= child_has_ts
+            continue
+        end
+
+        (T, _) = info
+        is_top_timestamp = top_level &&
+                           isempty(prefix) &&
+                           f.name == :timestamp &&
+                           f.ulog_type == "uint64_t" &&
+                           f.array_len == 0
+        if is_top_timestamp
+            has_ts = true
+            continue
+        end
+
+        name = prefixed_name(prefix, f.name)
+        if T == UInt8 && f.ulog_type == "char" && f.array_len > 0
+            col = repetitions == 1 ? Vector{String}(undef, N) : Matrix{String}(undef, N, repetitions)
+            insert_column!(cols, name, col)
+        elseif f.array_len == 0 && repetitions == 1
+            insert_column!(cols, name, Vector{T}(undef, N))
+        else
+            insert_column!(cols, name, Matrix{T}(undef, N, repetitions * field_count(f)))
+        end
+    end
+
+    return has_ts
+end
+
+function init_columns_prealloc(fmt::FormatDef, formats::Dict{String, FormatDef}, N::Int)
+    cols = Dict{Symbol, Any}()
+    has_ts = init_columns_for_format!(cols, fmt, formats, N; top_level=true)
+    ts = has_ts ? Vector{UInt64}(undef, N) : nothing
+    return cols, ts
+end
+
+function init_columns_prealloc(fmt::FormatDef, N::Int)
+    return init_columns_prealloc(fmt, Dict{String, FormatDef}(), N)
+end
+
+function decode_primitive_field!(
+    f::FieldDef,
+    payload::Vector{UInt8},
+    i::Int,
+    k::Int,
+    timestamp::Union{Vector{UInt64}, Nothing},
+    cols::Dict{Symbol, Any};
+    prefix::String,
+    repetition_index::Int,
+    repetitions::Int,
+    top_level::Bool,
+)::Int
+    (T, sz) = ulog_primitive(f.ulog_type)
+    is_top_timestamp = top_level &&
+                       isempty(prefix) &&
+                       f.name == :timestamp &&
+                       f.ulog_type == "uint64_t" &&
+                       f.array_len == 0
+
+    if f.array_len == 0
+        x = load_le(T, payload, i)
+        i += sz
+
+        if is_top_timestamp
+            timestamp === nothing && error("Internal: timestamp column not initialized")
+            timestamp[k] = x::UInt64
+        elseif repetitions == 1
+            cols[prefixed_name(prefix, f.name)][k] = x
+        else
+            cols[prefixed_name(prefix, f.name)][k, repetition_index] = x
+        end
+        return i
+    end
+
+    n = f.array_len
+    name = prefixed_name(prefix, f.name)
+    if T == UInt8 && f.ulog_type == "char"
+        bytes = payload[i:(i+n-1)]
+        lastnz = findlast(!=(0x00), bytes)
+        str = lastnz === nothing ? "" : String(bytes[1:lastnz])
+        if repetitions == 1
+            cols[name][k] = str
+        else
+            cols[name][k, repetition_index] = str
+        end
+        return i + n
+    end
+
+    M = cols[name]::Matrix{T}
+    base_col = (repetition_index - 1) * n
+    @inbounds for j in 1:n
+        M[k, base_col + j] = load_le(T, payload, i)
+        i += sz
+    end
+    return i
+end
+
+function decode_format_into_columns_at!(
+    fmt::FormatDef,
+    formats::Dict{String, FormatDef},
+    payload::Vector{UInt8},
+    i::Int,
+    k::Int,
+    timestamp::Union{Vector{UInt64}, Nothing},
+    cols::Dict{Symbol, Any};
+    prefix::String="",
+    repetition_index::Int=1,
+    repetitions::Int=1,
+    top_level::Bool=false,
+    omit_final_padding::Bool=false,
+)::Int
+    for (idx, f) in enumerate(fmt.fields)
+        if is_padding(f)
+            if !(top_level && omit_final_padding && idx == lastindex(fmt.fields))
+                (_, sz) = ulog_primitive(f.ulog_type)
+                i += sz * field_count(f)
+            end
+            continue
+        end
+
+        info = primitive_info(f.ulog_type)
+        if info === nothing
+            nested = format_lookup(formats, f.ulog_type)
+            n = field_count(f)
+            nested_repetitions = repetitions * n
+            prefix_child = child_prefix(prefix, f.name)
+            for r in 1:n
+                child_index = (repetition_index - 1) * n + r
+                i = decode_format_into_columns_at!(
+                    nested,
+                    formats,
+                    payload,
+                    i,
+                    k,
+                    timestamp,
+                    cols;
+                    prefix=prefix_child,
+                    repetition_index=child_index,
+                    repetitions=nested_repetitions,
+                    top_level=false,
+                    omit_final_padding=false,
+                )
+            end
+        else
+            i = decode_primitive_field!(
+                f,
+                payload,
+                i,
+                k,
+                timestamp,
+                cols;
+                prefix=prefix,
+                repetition_index=repetition_index,
+                repetitions=repetitions,
+                top_level=top_level,
+            )
+        end
+    end
+
+    return i
+end
+
+function decode_data_into_columns_at!(
+    fmt::FormatDef,
+    formats::Dict{String, FormatDef},
+    payload::Vector{UInt8},
+    k::Int,
+    timestamp::Union{Vector{UInt64}, Nothing},
+    cols::Dict{Symbol, Any};
+    omit_final_padding::Bool,
+)
+    i = decode_format_into_columns_at!(
+        fmt,
+        formats,
+        payload,
+        3,
+        k,
+        timestamp,
+        cols;
+        top_level=true,
+        omit_final_padding=omit_final_padding,
+    )
+    consumed = i - 3
+    expected = length(payload) - 2
+    consumed == expected || error("Internal: decoded $consumed struct bytes but payload contains $expected bytes")
+    return nothing
+end
+
+function decode_data_into_columns_at!(
+    fmt::FormatDef,
+    payload::Vector{UInt8},
+    k::Int,
+    timestamp::Union{Vector{UInt64}, Nothing},
+    cols::Dict{Symbol, Any},
+)
+    return decode_data_into_columns_at!(
+        fmt,
+        Dict{String, FormatDef}(),
+        payload,
+        k,
+        timestamp,
+        cols;
+        omit_final_padding=true,
+    )
 end
 
 @inline load_le(::Type{UInt8},  buf::Vector{UInt8}, i::Int) = buf[i]
@@ -456,101 +868,10 @@ end
     return UInt16(p[1]) | (UInt16(p[2]) << 8)
 end
 
-function expected_struct_bytes(fmt::FormatDef)::Int
-    total = 0
-    for f in fmt.fields
-        if startswith(String(f.name), "_padding")
-            continue
-        end
-        (_, sz) = ulog_primitive(f.ulog_type)
-        n = f.array_len == 0 ? 1 : f.array_len
-        total += sz * n
-    end
-    return total
-end
-
-function nonpadding_fields(fmt::FormatDef)
-    return [f for f in fmt.fields if !startswith(String(f.name), "_padding")]
-end
-
-function init_columns_prealloc(fmt::FormatDef, N::Int)
-    cols = Dict{Symbol, Any}()
-    has_ts = false
-
-    for f in nonpadding_fields(fmt)
-        if f.name == :timestamp && f.ulog_type == "uint64_t" && f.array_len == 0
-            has_ts = true
-            continue
-        end
-
-        (T, _) = ulog_primitive(f.ulog_type)
-
-        if f.array_len == 0
-            cols[f.name] = Vector{T}(undef, N)
-        else
-            if T == UInt8 && f.ulog_type == "char"
-                cols[f.name] = Vector{String}(undef, N)
-            else
-                cols[f.name] = Matrix{T}(undef, N, f.array_len)
-            end
-        end
-    end
-
-    ts = has_ts ? Vector{UInt64}(undef, N) : nothing
-    return cols, ts
-end
-
-function decode_data_into_columns_at!(
-    fmt::FormatDef,
-    payload::Vector{UInt8},
-    k::Int,
-    timestamp::Union{Vector{UInt64}, Nothing},
-    cols::Dict{Symbol, Any},
-)
-    i = 3  # after msg_id (2 bytes)
-
-    for f in fmt.fields
-        if startswith(String(f.name), "_padding")
-            continue
-        end
-
-        (T, sz) = ulog_primitive(f.ulog_type)
-
-        if f.array_len == 0
-            x = load_le(T, payload, i)
-            i += sz
-
-            if f.name == :timestamp && f.ulog_type == "uint64_t"
-                timestamp === nothing && error("Internal: timestamp column not initialized")
-                timestamp[k] = x::UInt64
-            else
-                cols[f.name][k] = x
-            end
-        else
-            n = f.array_len
-
-            if T == UInt8 && f.ulog_type == "char"
-                bytes = payload[i:(i+n-1)]
-                lastnz = findlast(!=(0x00), bytes)
-                cols[f.name][k] = lastnz === nothing ? "" : String(bytes[1:lastnz])
-                i += n
-            else
-                M = cols[f.name]::Matrix{T}
-                @inbounds for j in 1:n
-                    M[k, j] = load_le(T, payload, i)
-                    i += sz
-                end
-            end
-        end
-    end
-
-    return nothing
-end
-
 function count_data_samples(path::AbstractString, msg_id::UInt16)
     n = 0
     open(path, "r") do io
-        _ = read_ulog_header(io)
+        _ = read_ulog_preamble!(io)
         for msg in each_message(io)
             if msg.type == UInt8('D') && data_msg_id(msg) == msg_id
                 n += 1
@@ -575,26 +896,34 @@ function read_topic(path::AbstractString, topic_name::AbstractString, multi_id::
     fmt = fmts[String(topic_name)]
 
     N = count_data_samples(path, msg_id)
-    cols, ts = init_columns_prealloc(fmt, N)
+    cols, ts = init_columns_prealloc(fmt, fmts, N)
 
-    exp = expected_struct_bytes(fmt)
-    checked_len = false
+    expected_omitted = expected_struct_bytes(fmt, fmts)
+    expected_full = full_struct_bytes(fmt, fmts)
 
     k = 0
     open(path, "r") do io
-        _ = read_ulog_header(io)
+        _ = read_ulog_preamble!(io)
         for msg in each_message(io)
             if msg.type == UInt8('D') && data_msg_id(msg) == msg_id
                 k += 1
                 p = msg.payload
-                if !checked_len
-                    struct_len = length(p) - 2
-                    if struct_len != exp
-                        error("Unexpected struct length for topic=$(topic_name): got $struct_len bytes, expected $exp (excluding padding). DATA payload len=$(length(p))")
-                    end
-                    checked_len = true
-                end
-                decode_data_into_columns_at!(fmt, p, k, ts, cols)
+                omit_final_padding = final_padding_omitted(
+                    length(p) - 2,
+                    expected_omitted,
+                    expected_full,
+                    topic_name,
+                    length(p),
+                )
+                decode_data_into_columns_at!(
+                    fmt,
+                    fmts,
+                    p,
+                    k,
+                    ts,
+                    cols;
+                    omit_final_padding=omit_final_padding,
+                )
             end
         end
     end
@@ -615,18 +944,14 @@ function audit_data_lengths(path::AbstractString, topic_name::AbstractString, mu
     haskey(fmts, String(topic_name)) || error("No FORMAT definition found for topic=$(topic_name)")
     fmt = fmts[String(topic_name)]
 
-    expected = 0
-    for f in fmt.fields
-        (T, sz) = ulog_primitive(f.ulog_type)
-        n = f.array_len == 0 ? 1 : f.array_len
-        expected += sz * n
-    end
+    expected_omitted = expected_struct_bytes(fmt, fmts)
+    expected_full = full_struct_bytes(fmt, fmts)
 
     lengths = Dict{Int,Int}()
     hits = 0
 
     open(path, "r") do io
-        _ = read_ulog_header(io)
+        _ = read_ulog_preamble!(io)
         for msg in each_message(io)
             if msg.type == UInt8('D') && data_msg_id(msg) == msg_id
                 hits += 1
@@ -639,14 +964,15 @@ function audit_data_lengths(path::AbstractString, topic_name::AbstractString, mu
 
     println("Topic: $(topic_name) multi_id=$(multi_id)")
     println("msg_id: $(msg_id)")
-    println("Expected struct bytes (from FORMAT): $expected")
-    println("Expected DATA payload bytes (2 + struct): $(2 + expected)")
+    println("Expected struct bytes without final padding: $expected_omitted")
+    println("Expected struct bytes with final padding: $expected_full")
+    println("Expected DATA payload bytes: $(2 + expected_omitted) or $(2 + expected_full)")
     println("Observed DATA payload lengths (bytes):")
     for (L, c) in sort(collect(lengths); by=x->x[1])
         println("  $L : $c")
     end
 
-    return expected, lengths
+    return (expected_omitted, expected_full), lengths
 end
 
 # -----------------------------------------------------------------------------
@@ -664,7 +990,8 @@ end
 function ULog(path::AbstractString)
     p = String(path)
     hdr = open(p, "r") do io
-        read_ulog_header(io)
+        hdr, _ = read_ulog_preamble!(io)
+        hdr
     end
     fmts = read_all_formats(p)
     subs_by_id, subs_by_name = read_all_subscriptions(p)
@@ -680,7 +1007,7 @@ end
 function count_data_samples(ulog::ULog, msg_id::UInt16)
     n = 0
     open(ulog.path, "r") do io
-        _ = read_ulog_header(io)
+        _ = read_ulog_preamble!(io)
         for msg in each_message(io)
             if msg.type == UInt8('D') && data_msg_id(msg) == msg_id
                 n += 1
@@ -699,26 +1026,34 @@ function read_topic(ulog::ULog, topic_name::AbstractString, multi_id::Integer=0)
     fmt = ulog.formats[String(topic_name)]
 
     N = count_data_samples(ulog, msg_id)
-    cols, ts = init_columns_prealloc(fmt, N)
+    cols, ts = init_columns_prealloc(fmt, ulog.formats, N)
 
-    exp = expected_struct_bytes(fmt)
-    checked_len = false
+    expected_omitted = expected_struct_bytes(fmt, ulog.formats)
+    expected_full = full_struct_bytes(fmt, ulog.formats)
 
     k = 0
     open(ulog.path, "r") do io
-        _ = read_ulog_header(io)
+        _ = read_ulog_preamble!(io)
         for msg in each_message(io)
             if msg.type == UInt8('D') && data_msg_id(msg) == msg_id
                 k += 1
                 p = msg.payload
-                if !checked_len
-                    struct_len = length(p) - 2
-                    if struct_len != exp
-                        error("Unexpected struct length for topic=$(topic_name): got $struct_len bytes, expected $exp (excluding padding). DATA payload len=$(length(p))")
-                    end
-                    checked_len = true
-                end
-                decode_data_into_columns_at!(fmt, p, k, ts, cols)
+                omit_final_padding = final_padding_omitted(
+                    length(p) - 2,
+                    expected_omitted,
+                    expected_full,
+                    topic_name,
+                    length(p),
+                )
+                decode_data_into_columns_at!(
+                    fmt,
+                    ulog.formats,
+                    p,
+                    k,
+                    ts,
+                    cols;
+                    omit_final_padding=omit_final_padding,
+                )
             end
         end
     end
@@ -730,7 +1065,7 @@ end
 function build_data_index(ulog::ULog)
     index = Dict{UInt16, Vector{Int64}}()
     open(ulog.path, "r") do io
-        _ = read_ulog_header(io)
+        _ = read_ulog_preamble!(io)
         for msg in each_message(io)
             if msg.type == UInt8('D')
                 id = data_msg_id(msg)
@@ -752,10 +1087,10 @@ function read_topic(ulog::ULog, topic_name::AbstractString, multi_id::Integer, i
 
     offsets = get(index, msg_id, Int64[])
     N = length(offsets)
-    cols, ts = init_columns_prealloc(fmt, N)
+    cols, ts = init_columns_prealloc(fmt, ulog.formats, N)
 
-    exp = expected_struct_bytes(fmt)
-    checked_len = false
+    expected_omitted = expected_struct_bytes(fmt, ulog.formats)
+    expected_full = full_struct_bytes(fmt, ulog.formats)
 
     open(ulog.path, "r") do io
         for (k, off) in enumerate(offsets)
@@ -765,15 +1100,22 @@ function read_topic(ulog::ULog, topic_name::AbstractString, multi_id::Integer, i
             data_msg_id(msg) == msg_id || error("Index corruption: DATA at offset $off has wrong msg_id")
 
             p = msg.payload
-            if !checked_len
-                struct_len = length(p) - 2
-                if struct_len != exp
-                    error("Unexpected struct length for topic=$(topic_name): got $struct_len bytes, expected $exp (excluding padding). DATA payload len=$(length(p))")
-                end
-                checked_len = true
-            end
-
-            decode_data_into_columns_at!(fmt, p, k, ts, cols)
+            omit_final_padding = final_padding_omitted(
+                length(p) - 2,
+                expected_omitted,
+                expected_full,
+                topic_name,
+                length(p),
+            )
+            decode_data_into_columns_at!(
+                fmt,
+                ulog.formats,
+                p,
+                k,
+                ts,
+                cols;
+                omit_final_padding=omit_final_padding,
+            )
         end
     end
 

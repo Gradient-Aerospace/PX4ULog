@@ -18,6 +18,7 @@ It is intended for post-flight analysis, debugging, plotting, and research workf
 - Parses FORMAT (`F`) and ADD_LOGGED_MSG (`A`) definitions
 - Decodes DATA (`D`) messages into typed Julia data
 - Column-oriented storage for efficient access
+- Supports nested FORMAT definitions by flattening nested field paths
 - Supports multi-instance topics (`multi_id`)
 - Optional integration with DataFrames.jl (via extension)
 - No required dependencies beyond Julia itself
@@ -102,7 +103,12 @@ TopicData(
 
 - Scalar fields are stored as vectors
 - Fixed-size array fields are stored as matrices (`N × array_length`)
-- Padding fields are ignored
+- Nested fields are flattened with underscore-separated names
+- Padding fields are consumed where serialized and are not exposed as columns
+
+For example, a nested field such as `position_setpoint current` is exposed as
+columns like `current_lat`, `current_lon`, and `current_timestamp`. Arrays of
+nested structs are stored as matrices with one column per nested instance.
 
 ### Accessing data
 
@@ -154,8 +160,8 @@ This can be configured:
 
 ```julia
 PX4ULog.to_dataframe(att; expand_arrays=:columns)
-PX4ULog.to_dataframe(att; expand_arrays=:matrix)
-PX4ULog.to_dataframe(att; expand_arrays=:vector)
+PX4ULog.to_dataframe(att; expand_arrays=:rowviews)
+PX4ULog.to_dataframe(att; expand_arrays=:vectors)
 ```
 
 ---
@@ -167,6 +173,7 @@ PX4ULog.to_dataframe(att; expand_arrays=:vector)
   2. preallocate and decode
 - No per-row allocations during decoding
 - Array fields are stored as matrices, not vectors of vectors
+- Repeated topic reads can use `build_data_index(ulog)` to avoid rescanning
 - Suitable for large logs and repeated topic extraction
 
 ---
@@ -183,8 +190,8 @@ PX4ULog.to_dataframe(att; expand_arrays=:vector)
 ## Limitations
 
 - Logged parameters and events are not yet decoded
-- No support yet for partially corrupted logs
-- Assumes padding fields are not serialized in DATA messages
+- Abruptly truncated final messages are discarded, but full resynchronization
+  after arbitrary mid-file corruption is not implemented
 
 ---
 

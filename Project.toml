@@ -4,8 +4,10 @@ version = "0.1.0"
 authors = ["Carl"]
 
 [deps]
-DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+
+[weakdeps]
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 
 [extensions]
 PX4ULogDataFramesExt = "DataFrames"
