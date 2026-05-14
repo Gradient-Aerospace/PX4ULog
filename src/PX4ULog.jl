@@ -5,6 +5,10 @@ export FieldDef, FormatDef, scan_formats, read_all_formats, parse_format_string
 export Subscription, scan_subscriptions, read_all_subscriptions
 export TopicData, read_topic, count_data_samples
 export ULog, topics, build_data_index
+export ULogMetadata, ParameterChange, LoggedMessage
+export info_messages, info_message, info_types, info_multiple
+export initial_parameters, changed_parameters, default_parameters, has_default_parameters
+export logged_messages
 export time_seconds
 export audit_data_lengths
 export to_dataframe
@@ -90,6 +94,51 @@ struct TopicData
     cols::Dict{Symbol, Any}   # Symbol => Vector{T} or Matrix{T} or Vector{String}, etc.
 end
 
+struct ParameterChange
+    timestamp::UInt64
+    name::String
+    value::Any
+    ulog_type::String
+end
+
+struct LoggedMessage
+    timestamp::UInt64
+    level::UInt8
+    level_name::Symbol
+    message::String
+    tag::Union{Nothing,UInt16}
+end
+
+struct ULogMetadata
+    info::Dict{String, Any}
+    info_types::Dict{String, String}
+    info_multiple::Dict{String, Vector{Vector{Any}}}
+    info_multiple_types::Dict{String, String}
+    initial_parameters::Dict{String, Any}
+    initial_parameter_types::Dict{String, String}
+    default_parameters::Dict{Int, Dict{String, Any}}
+    default_parameter_types::Dict{Int, Dict{String, String}}
+    changed_parameters::Vector{ParameterChange}
+    logged_messages::Vector{LoggedMessage}
+    has_default_parameters::Bool
+end
+
+function ULogMetadata(; has_default_parameters::Bool=false)
+    return ULogMetadata(
+        Dict{String, Any}(),
+        Dict{String, String}(),
+        Dict{String, Vector{Vector{Any}}}(),
+        Dict{String, String}(),
+        Dict{String, Any}(),
+        Dict{String, String}(),
+        Dict{Int, Dict{String, Any}}(),
+        Dict{Int, Dict{String, String}}(),
+        ParameterChange[],
+        LoggedMessage[],
+        has_default_parameters,
+    )
+end
+
 # -----------------------------------------------------------------------------
 # Low-level binary helpers
 # -----------------------------------------------------------------------------
@@ -102,6 +151,10 @@ end
     b1 = read(io, UInt8)
     b2 = read(io, UInt8)
     return UInt16(b1) | (UInt16(b2) << 8)
+end
+
+@inline function read_u16_le(bytes::Vector{UInt8}, i::Int)::UInt16
+    return UInt16(bytes[i]) | (UInt16(bytes[i+1]) << 8)
 end
 
 @inline function read_u64_le(bytes::Vector{UInt8}, i::Int)::UInt64
@@ -261,14 +314,14 @@ end
 
 function scan_messages(path::AbstractString; max_messages::Int=2000, show_types::Bool=true)
     open(path, "r") do io
-        hdr = read_ulog_header(io)
+        hdr, _ = read_ulog_preamble!(io)
         println("ULog header:")
         println("  magic_ok            = $(hdr.magic_ok)")
         println("  version             = $(hdr.version)")
         println("  start_timestamp_us  = $(hdr.start_timestamp_us)")
         println()
 
-        counts = Dict{UInt8, Int}()
+        counts = Dict{UInt8, Int}(UInt8('B') => 1)
         n = 0
         for msg in each_message(io)
             n += 1
@@ -858,6 +911,212 @@ end
 end
 
 # -----------------------------------------------------------------------------
+# Metadata, parameters, and logged strings
+# -----------------------------------------------------------------------------
+
+struct TypedKeyValue
+    key::String
+    ulog_type::String
+    value::Any
+end
+
+function parse_type_token(tok::AbstractString)::Tuple{String, Int}
+    s = strip(tok)
+    m = match(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?$", s)
+    m === nothing && error("Invalid ULog type token: '$s'")
+    base = String(m.captures[1])
+    array_len = m.captures[2] === nothing ? 0 : parse(Int, m.captures[2])
+    return base, array_len
+end
+
+function trim_nul_string(bytes::Vector{UInt8})
+    lastnz = findlast(!=(0x00), bytes)
+    lastnz === nothing && return ""
+    return String(bytes[1:lastnz])
+end
+
+function decode_typed_value(ulog_type::AbstractString, payload::Vector{UInt8}, i::Int)
+    i > length(payload) && return UInt8[]
+    base_type, array_len = parse_type_token(ulog_type)
+
+    if base_type == "char" && array_len > 0
+        return trim_nul_string(payload[i:end])
+    end
+
+    if array_len == 0
+        info = primitive_info(base_type)
+        if info !== nothing
+            T, sz = info
+            i + sz - 1 <= length(payload) || error("Typed value '$ulog_type' is truncated")
+            return load_le(T, payload, i)
+        end
+    end
+
+    return copy(payload[i:end])
+end
+
+function decode_typed_key_value(payload::Vector{UInt8}, start::Int=1)::TypedKeyValue
+    start <= length(payload) || error("Typed key/value payload is empty")
+    key_len = Int(payload[start])
+    key_start = start + 1
+    value_start = key_start + key_len
+    value_start <= length(payload) + 1 || error("Typed key/value key is truncated")
+
+    type_key = String(payload[key_start:(value_start - 1)])
+    parts = split(type_key; limit=2)
+    length(parts) == 2 || error("Typed key/value key must be '<type> <name>', got '$type_key'")
+
+    ulog_type = String(parts[1])
+    key = String(parts[2])
+    value = decode_typed_value(ulog_type, payload, value_start)
+    return TypedKeyValue(key, ulog_type, value)
+end
+
+function decode_info_multiple(msg::ULogMessage)::Tuple{Bool, TypedKeyValue}
+    msg.type == UInt8('M') || error("decode_info_multiple: expected 'M', got $(Char(msg.type))")
+    length(msg.payload) >= 2 || error("INFO_MULTIPLE payload too short: $(length(msg.payload)) bytes")
+    continued = msg.payload[1] != 0x00
+    return continued, decode_typed_key_value(msg.payload, 2)
+end
+
+function add_info_multiple!(metadata::ULogMetadata, continued::Bool, kv::TypedKeyValue)
+    groups = get!(metadata.info_multiple, kv.key, Vector{Any}[])
+    if isempty(groups) || !continued
+        push!(groups, Any[kv.value])
+    else
+        push!(groups[end], kv.value)
+    end
+    metadata.info_multiple_types[kv.key] = kv.ulog_type
+    return nothing
+end
+
+function add_default_parameter!(metadata::ULogMetadata, default_types::UInt8, kv::TypedKeyValue)
+    for bit in 0:7
+        if (default_types & UInt8(1 << bit)) != 0
+            values = get!(metadata.default_parameters, bit, Dict{String, Any}())
+            types = get!(metadata.default_parameter_types, bit, Dict{String, String}())
+            values[kv.key] = kv.value
+            types[kv.key] = kv.ulog_type
+        end
+    end
+    return nothing
+end
+
+const LOG_LEVEL_NAMES = Dict{UInt8, Symbol}(
+    UInt8('0') => :EMERGENCY,
+    UInt8('1') => :ALERT,
+    UInt8('2') => :CRITICAL,
+    UInt8('3') => :ERROR,
+    UInt8('4') => :WARNING,
+    UInt8('5') => :NOTICE,
+    UInt8('6') => :INFO,
+    UInt8('7') => :DEBUG,
+)
+
+log_level_name(level::UInt8) = get(LOG_LEVEL_NAMES, level, :UNKNOWN)
+
+function decode_logged_message(msg::ULogMessage)::LoggedMessage
+    p = msg.payload
+    if msg.type == UInt8('L')
+        length(p) >= 9 || error("LOGGING payload too short: $(length(p)) bytes")
+        level = p[1]
+        timestamp = read_u64_le(p, 2)
+        message = length(p) >= 10 ? String(p[10:end]) : ""
+        return LoggedMessage(timestamp, level, log_level_name(level), message, nothing)
+    elseif msg.type == UInt8('C')
+        length(p) >= 11 || error("LOGGING_TAGGED payload too short: $(length(p)) bytes")
+        level = p[1]
+        tag = read_u16_le(p, 2)
+        timestamp = read_u64_le(p, 4)
+        message = length(p) >= 12 ? String(p[12:end]) : ""
+        return LoggedMessage(timestamp, level, log_level_name(level), message, tag)
+    else
+        error("decode_logged_message: expected 'L' or 'C', got $(Char(msg.type))")
+    end
+end
+
+function data_timestamp_or_nothing(
+    msg::ULogMessage,
+    formats::Dict{String, FormatDef},
+    subs_by_id::Dict{UInt16, Subscription},
+)::Union{UInt64, Nothing}
+    msg.type == UInt8('D') || return nothing
+    id = data_msg_id(msg)
+    sub = get(subs_by_id, id, nothing)
+    sub === nothing && return nothing
+    fmt = get(formats, sub.name, nothing)
+    fmt === nothing && return nothing
+
+    i = 3
+    for f in fmt.fields
+        if f.name == :timestamp && f.ulog_type == "uint64_t" && f.array_len == 0
+            i + 7 <= length(msg.payload) && return load_le(UInt64, msg.payload, i)
+            return nothing
+        end
+
+        info = primitive_info(f.ulog_type)
+        if info === nothing
+            nested = format_lookup(formats, f.ulog_type)
+            i += field_count(f) * full_struct_bytes(nested, formats)
+        else
+            _, sz = info
+            i += sz * field_count(f)
+        end
+        i > length(msg.payload) && return nothing
+    end
+    return nothing
+end
+
+function read_all_metadata(
+    path::AbstractString,
+    formats::Dict{String, FormatDef},
+    subs_by_id::Dict{UInt16, Subscription},
+)::ULogMetadata
+    open(path, "r") do io
+        hdr, flags = read_ulog_preamble!(io)
+        metadata = ULogMetadata(; has_default_parameters=(flags.compat_flags[1] & 0x01) != 0)
+
+        data_section_started = false
+        last_timestamp = hdr.start_timestamp_us
+        for msg in each_message(io)
+            if msg.type == UInt8('I')
+                kv = decode_typed_key_value(msg.payload)
+                metadata.info[kv.key] = kv.value
+                metadata.info_types[kv.key] = kv.ulog_type
+            elseif msg.type == UInt8('M')
+                continued, kv = decode_info_multiple(msg)
+                add_info_multiple!(metadata, continued, kv)
+            elseif msg.type == UInt8('P')
+                kv = decode_typed_key_value(msg.payload)
+                if data_section_started
+                    push!(metadata.changed_parameters, ParameterChange(last_timestamp, kv.key, kv.value, kv.ulog_type))
+                else
+                    metadata.initial_parameters[kv.key] = kv.value
+                    metadata.initial_parameter_types[kv.key] = kv.ulog_type
+                end
+            elseif msg.type == UInt8('Q')
+                length(msg.payload) >= 2 || error("PARAMETER_DEFAULT payload too short: $(length(msg.payload)) bytes")
+                default_types = msg.payload[1]
+                kv = decode_typed_key_value(msg.payload, 2)
+                add_default_parameter!(metadata, default_types, kv)
+            elseif msg.type == UInt8('D')
+                data_section_started = true
+                ts = data_timestamp_or_nothing(msg, formats, subs_by_id)
+                ts === nothing || (last_timestamp = ts)
+            elseif msg.type == UInt8('A')
+                data_section_started = true
+            elseif msg.type == UInt8('L') || msg.type == UInt8('C')
+                data_section_started = true
+                push!(metadata.logged_messages, decode_logged_message(msg))
+            elseif msg.type == UInt8('R') || msg.type == UInt8('O') || msg.type == UInt8('S')
+                data_section_started = true
+            end
+        end
+        return metadata
+    end
+end
+
+# -----------------------------------------------------------------------------
 # DATA ('D')
 # -----------------------------------------------------------------------------
 
@@ -985,6 +1244,7 @@ struct ULog
     formats::Dict{String, FormatDef}
     subs_by_id::Dict{UInt16, Subscription}
     subs_by_name::Dict{Tuple{String,UInt8}, UInt16}
+    metadata::ULogMetadata
 end
 
 function ULog(path::AbstractString)
@@ -995,7 +1255,45 @@ function ULog(path::AbstractString)
     end
     fmts = read_all_formats(p)
     subs_by_id, subs_by_name = read_all_subscriptions(p)
-    return ULog(p, hdr, fmts, subs_by_id, subs_by_name)
+    metadata = read_all_metadata(p, fmts, subs_by_id)
+    return ULog(p, hdr, fmts, subs_by_id, subs_by_name, metadata)
+end
+
+info_messages(ulog::ULog) = ulog.metadata.info
+
+info_types(ulog::ULog) = ulog.metadata.info_types
+
+info_multiple(ulog::ULog) = ulog.metadata.info_multiple
+
+info_message(ulog::ULog, key::AbstractString; default=nothing) =
+    get(ulog.metadata.info, String(key), default)
+
+initial_parameters(ulog::ULog) = ulog.metadata.initial_parameters
+
+changed_parameters(ulog::ULog) = ulog.metadata.changed_parameters
+
+function default_parameter_index(which::Symbol)::Int
+    which === :system && return 0
+    which === :current_setup && return 1
+    error("Unknown default parameter set: $which. Use :system, :current_setup, or an integer bit index.")
+end
+
+function default_parameters(ulog::ULog, which::Symbol=:system)
+    return default_parameters(ulog, default_parameter_index(which))
+end
+
+function default_parameters(ulog::ULog, which::Integer)
+    return get(ulog.metadata.default_parameters, Int(which), Dict{String, Any}())
+end
+
+has_default_parameters(ulog::ULog) =
+    ulog.metadata.has_default_parameters || !isempty(ulog.metadata.default_parameters)
+
+function logged_messages(ulog::ULog; tag=nothing)
+    msgs = ulog.metadata.logged_messages
+    tag === nothing && return msgs
+    tag_value = UInt16(tag)
+    return [msg for msg in msgs if msg.tag == tag_value]
 end
 
 function topics(ulog::ULog)

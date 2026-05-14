@@ -16,6 +16,7 @@ It is intended for post-flight analysis, debugging, plotting, and research workf
 
 - Reads ULog headers and message records
 - Parses FORMAT (`F`) and ADD_LOGGED_MSG (`A`) definitions
+- Decodes metadata, parameters, default parameters, and logged strings
 - Decodes DATA (`D`) messages into typed Julia data
 - Column-oriented storage for efficient access
 - Supports nested FORMAT definitions by flattening nested field paths
@@ -63,6 +64,9 @@ This reads:
 - the ULog header
 - all FORMAT definitions
 - all topic subscriptions
+- INFO and INFO_MULTIPLE metadata
+- initial/default parameters and later parameter changes
+- logged string messages
 
 No DATA messages are decoded at this stage.
 
@@ -85,6 +89,31 @@ att = PX4ULog.read_topic(ulog, "vehicle_attitude", 0)
 ```
 
 This decodes all samples for the given topic and returns a `TopicData` object.
+
+---
+
+### Read metadata and parameters
+
+```julia
+PX4ULog.info_message(ulog, "camera_model")
+PX4ULog.info_message(ulog, "camera_serial_number")
+PX4ULog.initial_parameters(ulog)["AIRCRAFT_ID"]
+PX4ULog.logged_messages(ulog)
+```
+
+Other metadata helpers include:
+
+```julia
+PX4ULog.info_messages(ulog)
+PX4ULog.info_types(ulog)
+PX4ULog.info_multiple(ulog)
+PX4ULog.changed_parameters(ulog)
+PX4ULog.default_parameters(ulog, :system)
+PX4ULog.default_parameters(ulog, :current_setup)
+PX4ULog.has_default_parameters(ulog)
+```
+
+`logged_messages(ulog; tag=...)` filters tagged log messages by tag.
 
 ---
 
@@ -189,7 +218,7 @@ PX4ULog.to_dataframe(att; expand_arrays=:vectors)
 
 ## Limitations
 
-- Logged parameters and events are not yet decoded
+- PX4 event metadata is not yet expanded into high-level event objects
 - Abruptly truncated final messages are discarded, but full resynchronization
   after arbitrary mid-file corruption is not implemented
 
