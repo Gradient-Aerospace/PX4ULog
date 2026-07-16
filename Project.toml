@@ -3,6 +3,9 @@ uuid = "f9a4f512-fe73-430d-b50d-a67499c1e6e0"
 version = "0.1.0"
 authors = ["Carl"]
 
+[workspace]
+projects = ["test"]
+
 [deps]
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 

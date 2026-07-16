@@ -1,3 +1,9 @@
+"""
+    PX4ULog
+
+Read standard PX4 ULog (`.ulg`) files, inspect their metadata, and decode topic data into
+typed, column-oriented Julia arrays.
+"""
 module PX4ULog
 
 export ULogHeader, ULogMessage, read_ulog_header, each_message, scan_messages
@@ -20,8 +26,14 @@ using Printf
 # -----------------------------------------------------------------------------
 
 """
-Convert TopicData to a DataFrame. Methods are provided by an extension when
-DataFrames is loaded.
+    to_dataframe(td::TopicData; kwargs...)
+    to_dataframe(ulog::ULog, topic_name, multi_id = 0; kwargs...)
+
+Convert decoded topic data to a `DataFrame`. Methods are provided by the optional
+DataFrames extension after DataFrames.jl is loaded.
+
+Set `time_s = true` to add time in seconds and use `expand_arrays` to select
+`:columns`, `:rowviews`, or `:vectors` for fixed-size array fields.
 """
 function to_dataframe end
 
@@ -30,7 +42,10 @@ function to_dataframe end
 # -----------------------------------------------------------------------------
 
 """
-Represents the fixed header area at the start of a ULog file.
+    ULogHeader
+
+The fixed 16-byte header at the start of a ULog file. `start_timestamp_us` is the
+logging start timestamp in microseconds.
 """
 struct ULogHeader
     magic_ok::Bool
@@ -42,11 +57,11 @@ end
 const ULOG_MAGIC = UInt8[0x55, 0x4c, 0x6f, 0x67, 0x01, 0x12, 0x35]  # "ULog" + 0x01 0x12 0x35
 
 """
-Represents a single ULog message record.
-- size: msg_size field from the file (little-endian)
-- type: UInt8 message type (typically ASCII)
-- payload: raw payload bytes
-- offset: file offset where msg_size starts
+    ULogMessage
+
+A complete ULog message record. `offset` is the zero-based byte offset of the record,
+`size` is the payload length, `type` is the ASCII message type byte, and `payload`
+contains the raw message bytes.
 """
 struct ULogMessage
     offset::Int64
@@ -62,10 +77,10 @@ struct FlagBits
 end
 
 """
-Field definition from a FORMAT message.
-- `name`: field name
-- `ulog_type`: primitive token or nested format name
-- `array_len`: 0 = scalar, >0 = fixed array
+    FieldDef
+
+A field parsed from a ULog `FORMAT` record. `array_len == 0` denotes a scalar;
+positive values denote a fixed-size array.
 """
 struct FieldDef
     name::Symbol
@@ -74,19 +89,37 @@ struct FieldDef
 end
 
 """
-Format definition from a FORMAT message.
+    FormatDef
+
+A named ULog message format and its ordered fields.
 """
 struct FormatDef
     name::String
     fields::Vector{FieldDef}
 end
 
+"""
+    Subscription
+
+A topic subscription from an `ADD_LOGGED_MSG` record, identified by `msg_id`,
+`multi_id`, and topic `name`.
+"""
 struct Subscription
     msg_id::UInt16
     multi_id::UInt8
     name::String
 end
 
+"""
+    TopicData
+
+Decoded samples for one topic instance. Timestamps are in microseconds. Scalar fields
+are vectors, fixed-size arrays are matrices with one row per sample, character arrays
+are strings, and nested field names are flattened with underscores.
+
+Fields in `cols` are also available through property and symbol indexing. The stored
+arrays are mutable and returned directly.
+"""
 struct TopicData
     topic::String
     multi_id::UInt8
@@ -94,6 +127,12 @@ struct TopicData
     cols::Dict{Symbol, Any}   # Symbol => Vector{T} or Matrix{T} or Vector{String}, etc.
 end
 
+"""
+    ParameterChange
+
+A parameter update found after the ULog data section starts. `timestamp` is in
+microseconds, `value` is the decoded Julia value, and `ulog_type` is the source type.
+"""
 struct ParameterChange
     timestamp::UInt64
     name::String
@@ -101,6 +140,13 @@ struct ParameterChange
     ulog_type::String
 end
 
+"""
+    LoggedMessage
+
+A standard ULog text message. `timestamp` is in microseconds, `level` is the raw log
+level byte, `level_name` is its symbolic interpretation, and `tag` is present only for
+tagged messages.
+"""
 struct LoggedMessage
     timestamp::UInt64
     level::UInt8
@@ -109,6 +155,13 @@ struct LoggedMessage
     tag::Union{Nothing,UInt16}
 end
 
+"""
+    ULogMetadata
+
+Decoded non-topic records: information messages, multi-information groups, initial and
+default parameters, parameter changes, and logged strings. Dictionaries and vectors
+are mutable and are exposed directly by the metadata accessors.
+"""
 struct ULogMetadata
     info::Dict{String, Any}
     info_types::Dict{String, String}
@@ -202,7 +255,9 @@ end
 
 function decode_flag_bits(msg::ULogMessage)::FlagBits
     msg.type == UInt8('B') || error("decode_flag_bits: expected 'B', got $(Char(msg.type))")
-    length(msg.payload) == 40 || error("FLAG_BITS payload has $(length(msg.payload)) bytes, expected 40")
+    length(msg.payload) == 40 || error(
+        "FLAG_BITS payload has $(length(msg.payload)) bytes, expected 40",
+    )
 
     p = msg.payload
     compat_flags = ntuple(i -> p[i], 8)
@@ -229,7 +284,9 @@ function read_ulog_preamble!(io::IO)::Tuple{ULogHeader, FlagBits}
     validate_ulog_header(hdr)
 
     msg = read_message_at!(io)
-    msg.type == UInt8('B') || error("Expected ULog flag-bits message ('B') immediately after header")
+    msg.type == UInt8('B') || error(
+        "Expected ULog flag-bits message ('B') immediately after header",
+    )
     flags = decode_flag_bits(msg)
     validate_flag_bits(flags)
 
@@ -312,7 +369,18 @@ end
 # Debug scan: message counts
 # -----------------------------------------------------------------------------
 
-function scan_messages(path::AbstractString; max_messages::Int=2000, show_types::Bool=true)
+"""
+    scan_messages(path; max_messages = 2000, show_types = true)
+
+Print a diagnostic summary of complete ULog records and return their counts by message
+type. A truncated final record is ignored. This function performs file I/O and writes
+to standard output.
+"""
+function scan_messages(
+    path::AbstractString;
+    max_messages::Int = 2000,
+    show_types::Bool = true,
+)
     open(path, "r") do io
         hdr, _ = read_ulog_preamble!(io)
         println("ULog header:")
@@ -328,8 +396,15 @@ function scan_messages(path::AbstractString; max_messages::Int=2000, show_types:
             counts[msg.type] = get(counts, msg.type, 0) + 1
 
             if n <= 20
-                @printf("msg %5d  off=%10d  type=%c (0x%02x)  size=%d  payload=%d\n",
-                        n, msg.offset, ascii_type(msg.type), msg.type, msg.size, length(msg.payload))
+                @printf(
+                    "msg %5d  off=%10d  type=%c (0x%02x)  size=%d  payload=%d\n",
+                    n,
+                    msg.offset,
+                    ascii_type(msg.type),
+                    msg.type,
+                    msg.size,
+                    length(msg.payload),
+                )
             end
 
             if n >= max_messages
@@ -388,6 +463,12 @@ function parse_field_token(tok::AbstractString)::FieldDef
     return FieldDef(Symbol(field_name), base_type, array_len)
 end
 
+"""
+    parse_format_string(format_string) -> FormatDef
+
+Parse the payload text of one ULog `FORMAT` record. Invalid field syntax throws an
+`ErrorException`; nested type references are validated when all formats are loaded.
+"""
 function parse_format_string(fmt::AbstractString)::FormatDef
     s = strip(fmt)
     isempty(s) && error("Empty FORMAT string")
@@ -411,6 +492,12 @@ function parse_format_string(fmt::AbstractString)::FormatDef
     return FormatDef(String(name), fields)
 end
 
+"""
+    read_all_formats(path) -> Dict{String,FormatDef}
+
+Read and validate every ULog format definition. Forward references are accepted;
+unknown nested formats and cyclic definitions throw an `ErrorException`.
+"""
 function read_all_formats(path::AbstractString)
     open(path, "r") do io
         _ = read_ulog_preamble!(io)
@@ -424,11 +511,17 @@ function read_all_formats(path::AbstractString)
             end
         end
 
+        validate_format_graph(formats)
         return formats
     end
 end
 
-function scan_formats(path::AbstractString; max_formats::Int=20)
+"""
+    scan_formats(path; max_formats = 20) -> Int
+
+Print up to `max_formats` raw ULog format definitions and return the number printed.
+"""
+function scan_formats(path::AbstractString; max_formats::Int = 20)
     open(path, "r") do io
         _ = read_ulog_preamble!(io)
 
@@ -476,6 +569,12 @@ function decode_add_logged_msg(msg::ULogMessage)::Subscription
     return Subscription(msg_id, multi_id, name)
 end
 
+"""
+    read_all_subscriptions(path)
+
+Read all topic subscriptions. Return dictionaries indexed by message identifier and by
+`(topic_name, multi_id)`. Later records replace earlier records with the same key.
+"""
 function read_all_subscriptions(path::AbstractString)
     open(path, "r") do io
         _ = read_ulog_preamble!(io)
@@ -495,7 +594,12 @@ function read_all_subscriptions(path::AbstractString)
     end
 end
 
-function scan_subscriptions(path::AbstractString; max_subs::Int=30)
+"""
+    scan_subscriptions(path; max_subs = 30) -> Int
+
+Print up to `max_subs` topic subscriptions and return the number printed.
+"""
+function scan_subscriptions(path::AbstractString; max_subs::Int = 30)
     open(path, "r") do io
         _ = read_ulog_preamble!(io)
         n = 0
@@ -503,7 +607,13 @@ function scan_subscriptions(path::AbstractString; max_subs::Int=30)
             if msg.type == UInt8('A')
                 n += 1
                 sub = decode_add_logged_msg(msg)
-                @printf("A[%3d] msg_id=%5d  multi_id=%d  name=%s\n", n, sub.msg_id, sub.multi_id, sub.name)
+                @printf(
+                    "A[%3d] msg_id=%5d  multi_id=%d  name=%s\n",
+                    n,
+                    sub.msg_id,
+                    sub.multi_id,
+                    sub.name,
+                )
                 if n >= max_subs
                     break
                 end
@@ -547,6 +657,40 @@ function format_lookup(formats::Dict{String, FormatDef}, name::AbstractString)::
     key = String(name)
     haskey(formats, key) || error("Unknown nested ULog format: '$key'")
     return formats[key]
+end
+
+function validate_format_graph(formats::Dict{String, FormatDef})
+    states = Dict{String, UInt8}()
+    stack = String[]
+
+    function visit(name::String)
+        state = get(states, name, 0x00)
+        if state == 0x01
+            cycle_start = findfirst(==(name), stack)
+            cycle = join([stack[cycle_start:end]; name], " -> ")
+            error("Circular ULog FORMAT definition: $cycle")
+        elseif state == 0x02
+            return nothing
+        end
+
+        fmt = format_lookup(formats, name)
+        states[name] = 0x01
+        push!(stack, name)
+        for field in fmt.fields
+            primitive_info(field.ulog_type) === nothing || continue
+            nested = String(field.ulog_type)
+            format_lookup(formats, nested)
+            visit(nested)
+        end
+        pop!(stack)
+        states[name] = 0x02
+        return nothing
+    end
+
+    for name in keys(formats)
+        visit(name)
+    end
+    return nothing
 end
 
 function prefixed_name(prefix::AbstractString, name::Symbol)::Symbol
@@ -628,9 +772,16 @@ function final_padding_omitted(
     end
 
     if expected_omitted == expected_full
-        error("Unexpected struct length for topic=$(topic_name): got $struct_len bytes, expected $expected_omitted. DATA payload len=$(payload_len)")
+        error(
+            "Unexpected struct length for topic=$(topic_name): got $struct_len bytes, " *
+            "expected $expected_omitted. DATA payload len=$(payload_len)",
+        )
     else
-        error("Unexpected struct length for topic=$(topic_name): got $struct_len bytes, expected $expected_omitted without final padding or $expected_full with final padding. DATA payload len=$(payload_len)")
+        error(
+            "Unexpected struct length for topic=$(topic_name): got $struct_len bytes, " *
+            "expected $expected_omitted without final padding or $expected_full with " *
+            "final padding. DATA payload len=$(payload_len)",
+        )
     end
 end
 
@@ -677,7 +828,9 @@ function init_columns_for_format!(
 
         name = prefixed_name(prefix, f.name)
         if T == UInt8 && f.ulog_type == "char" && f.array_len > 0
-            col = repetitions == 1 ? Vector{String}(undef, N) : Matrix{String}(undef, N, repetitions)
+            col = repetitions == 1 ?
+                Vector{String}(undef, N) :
+                Matrix{String}(undef, N, repetitions)
             insert_column!(cols, name, col)
         elseif f.array_len == 0 && repetitions == 1
             insert_column!(cols, name, Vector{T}(undef, N))
@@ -737,9 +890,11 @@ function decode_primitive_field!(
     n = f.array_len
     name = prefixed_name(prefix, f.name)
     if T == UInt8 && f.ulog_type == "char"
-        bytes = payload[i:(i+n-1)]
-        lastnz = findlast(!=(0x00), bytes)
-        str = lastnz === nothing ? "" : String(bytes[1:lastnz])
+        last_nonzero = i + n - 1
+        while last_nonzero >= i && payload[last_nonzero] == 0x00
+            last_nonzero -= 1
+        end
+        str = last_nonzero < i ? "" : String(payload[i:last_nonzero])
         if repetitions == 1
             cols[name][k] = str
         else
@@ -844,7 +999,9 @@ function decode_data_into_columns_at!(
     )
     consumed = i - 3
     expected = length(payload) - 2
-    consumed == expected || error("Internal: decoded $consumed struct bytes but payload contains $expected bytes")
+    consumed == expected || error(
+        "Internal: decoded $consumed struct bytes but payload contains $expected bytes",
+    )
     return nothing
 end
 
@@ -870,14 +1027,14 @@ end
 @inline load_le(::Type{Bool},   buf::Vector{UInt8}, i::Int) = buf[i] != 0x00
 
 @inline function load_le(::Type{Int8}, buf::Vector{UInt8}, i::Int)
-    return reinterpret(Int8, buf[i:i])[1]
+    return reinterpret(Int8, buf[i])
 end
 
 @inline function load_le(::Type{UInt16}, buf::Vector{UInt8}, i::Int)
     return UInt16(buf[i]) | (UInt16(buf[i+1]) << 8)
 end
 @inline function load_le(::Type{Int16}, buf::Vector{UInt8}, i::Int)
-    return reinterpret(Int16, load_le(UInt16, buf, i))[1]
+    return reinterpret(Int16, load_le(UInt16, buf, i))
 end
 
 @inline function load_le(::Type{UInt32}, buf::Vector{UInt8}, i::Int)
@@ -887,7 +1044,7 @@ end
            (UInt32(buf[i+3]) << 24)
 end
 @inline function load_le(::Type{Int32}, buf::Vector{UInt8}, i::Int)
-    return reinterpret(Int32, load_le(UInt32, buf, i))[1]
+    return reinterpret(Int32, load_le(UInt32, buf, i))
 end
 
 @inline function load_le(::Type{UInt64}, buf::Vector{UInt8}, i::Int)
@@ -898,16 +1055,16 @@ end
     return x
 end
 @inline function load_le(::Type{Int64}, buf::Vector{UInt8}, i::Int)
-    return reinterpret(Int64, load_le(UInt64, buf, i))[1]
+    return reinterpret(Int64, load_le(UInt64, buf, i))
 end
 
 @inline function load_le(::Type{Float32}, buf::Vector{UInt8}, i::Int)
     u = load_le(UInt32, buf, i)
-    return reinterpret(Float32, u)[1]
+    return reinterpret(Float32, u)
 end
 @inline function load_le(::Type{Float64}, buf::Vector{UInt8}, i::Int)
     u = load_le(UInt64, buf, i)
-    return reinterpret(Float64, u)[1]
+    return reinterpret(Float64, u)
 end
 
 # -----------------------------------------------------------------------------
@@ -929,27 +1086,41 @@ function parse_type_token(tok::AbstractString)::Tuple{String, Int}
     return base, array_len
 end
 
-function trim_nul_string(bytes::Vector{UInt8})
-    lastnz = findlast(!=(0x00), bytes)
-    lastnz === nothing && return ""
-    return String(bytes[1:lastnz])
+function trim_nul_string(bytes::Vector{UInt8}, start::Int, len::Int)
+    last_nonzero = start + len - 1
+    while last_nonzero >= start && bytes[last_nonzero] == 0x00
+        last_nonzero -= 1
+    end
+    last_nonzero < start && return ""
+    return String(bytes[start:last_nonzero])
 end
 
 function decode_typed_value(ulog_type::AbstractString, payload::Vector{UInt8}, i::Int)
-    i > length(payload) && return UInt8[]
     base_type, array_len = parse_type_token(ulog_type)
+    is_array = occursin('[', ulog_type)
+    remaining = length(payload) - i + 1
+    remaining >= 0 || error("Typed value '$ulog_type' starts past the payload")
+    info = primitive_info(base_type)
 
-    if base_type == "char" && array_len > 0
-        return trim_nul_string(payload[i:end])
+    if base_type == "char" && is_array
+        remaining == array_len || error(
+            "Typed value '$ulog_type' has $remaining bytes, expected $array_len",
+        )
+        return trim_nul_string(payload, i, array_len)
     end
 
-    if array_len == 0
-        info = primitive_info(base_type)
-        if info !== nothing
-            T, sz = info
-            i + sz - 1 <= length(payload) || error("Typed value '$ulog_type' is truncated")
-            return load_le(T, payload, i)
-        end
+    if info !== nothing && !is_array
+        T, size = info
+        remaining == size || error(
+            "Typed value '$ulog_type' has $remaining bytes, expected $size",
+        )
+        return load_le(T, payload, i)
+    elseif info !== nothing
+        _, size = info
+        expected = size * array_len
+        remaining == expected || error(
+            "Typed value '$ulog_type' has $remaining bytes, expected $expected",
+        )
     end
 
     return copy(payload[i:end])
@@ -974,23 +1145,29 @@ end
 
 function decode_info_multiple(msg::ULogMessage)::Tuple{Bool, TypedKeyValue}
     msg.type == UInt8('M') || error("decode_info_multiple: expected 'M', got $(Char(msg.type))")
-    length(msg.payload) >= 2 || error("INFO_MULTIPLE payload too short: $(length(msg.payload)) bytes")
+    length(msg.payload) >= 2 || error(
+        "INFO_MULTIPLE payload too short: $(length(msg.payload)) bytes",
+    )
     continued = msg.payload[1] != 0x00
     return continued, decode_typed_key_value(msg.payload, 2)
 end
 
 function add_info_multiple!(metadata::ULogMetadata, continued::Bool, kv::TypedKeyValue)
     groups = get!(metadata.info_multiple, kv.key, Vector{Any}[])
-    if isempty(groups) || !continued
-        push!(groups, Any[kv.value])
-    else
+    if continued
+        isempty(groups) && error(
+            "INFO_MULTIPLE continuation for '$(kv.key)' has no preceding chunk",
+        )
         push!(groups[end], kv.value)
+    else
+        push!(groups, Any[kv.value])
     end
     metadata.info_multiple_types[kv.key] = kv.ulog_type
     return nothing
 end
 
 function add_default_parameter!(metadata::ULogMetadata, default_types::UInt8, kv::TypedKeyValue)
+    iszero(default_types) && error("PARAMETER_DEFAULT has an empty default-types bitfield")
     for bit in 0:7
         if (default_types & UInt8(1 << bit)) != 0
             values = get!(metadata.default_parameters, bit, Dict{String, Any}())
@@ -999,6 +1176,18 @@ function add_default_parameter!(metadata::ULogMetadata, default_types::UInt8, kv
             types[kv.key] = kv.ulog_type
         end
     end
+    return nothing
+end
+
+function validate_parameter_type(kv::TypedKeyValue, record_name::AbstractString)
+    base_type, array_len = parse_type_token(kv.ulog_type)
+    is_array = occursin('[', kv.ulog_type)
+    valid = !is_array && array_len == 0 &&
+            (base_type == "int32_t" || base_type == "float")
+    valid || error(
+        "$record_name parameter '$(kv.key)' has unsupported type '$(kv.ulog_type)'; " *
+        "expected int32_t or float",
+    )
     return nothing
 end
 
@@ -1088,16 +1277,23 @@ function read_all_metadata(
                 add_info_multiple!(metadata, continued, kv)
             elseif msg.type == UInt8('P')
                 kv = decode_typed_key_value(msg.payload)
+                validate_parameter_type(kv, "PARAMETER")
                 if data_section_started
-                    push!(metadata.changed_parameters, ParameterChange(last_timestamp, kv.key, kv.value, kv.ulog_type))
+                    push!(
+                        metadata.changed_parameters,
+                        ParameterChange(last_timestamp, kv.key, kv.value, kv.ulog_type),
+                    )
                 else
                     metadata.initial_parameters[kv.key] = kv.value
                     metadata.initial_parameter_types[kv.key] = kv.ulog_type
                 end
             elseif msg.type == UInt8('Q')
-                length(msg.payload) >= 2 || error("PARAMETER_DEFAULT payload too short: $(length(msg.payload)) bytes")
+                length(msg.payload) >= 2 || error(
+                    "PARAMETER_DEFAULT payload too short: $(length(msg.payload)) bytes",
+                )
                 default_types = msg.payload[1]
                 kv = decode_typed_key_value(msg.payload, 2)
+                validate_parameter_type(kv, "PARAMETER_DEFAULT")
                 add_default_parameter!(metadata, default_types, kv)
             elseif msg.type == UInt8('D')
                 data_section_started = true
@@ -1127,6 +1323,12 @@ end
     return UInt16(p[1]) | (UInt16(p[2]) << 8)
 end
 
+"""
+    count_data_samples(path_or_ulog, msg_id) -> Int
+
+Count complete `DATA` records for one message identifier. This scans the log once and
+does not decode the samples.
+"""
 function count_data_samples(path::AbstractString, msg_id::UInt16)
     n = 0
     open(path, "r") do io
@@ -1141,14 +1343,22 @@ function count_data_samples(path::AbstractString, msg_id::UInt16)
 end
 
 """
-Read a topic from a path into TopicData (fast two-pass, preallocated).
+    read_topic(path_or_ulog, topic_name, multi_id = 0) -> TopicData
+    read_topic(ulog, topic_name, multi_id, index) -> TopicData
+
+Decode all samples for one topic instance into preallocated, column-oriented storage.
+The non-indexed overload performs a count pass followed by a decode pass. The indexed
+overload uses offsets from [`build_data_index`](@ref). Missing subscriptions, malformed
+formats, and invalid data payload lengths throw an `ErrorException`.
 """
 function read_topic(path::AbstractString, topic_name::AbstractString, multi_id::Integer=0)
     fmts = read_all_formats(path)
     _, subs_by_name = read_all_subscriptions(path)
 
     key = (String(topic_name), UInt8(multi_id))
-    haskey(subs_by_name, key) || error("No subscription for topic=$(topic_name) multi_id=$(multi_id)")
+    haskey(subs_by_name, key) || error(
+        "No subscription for topic=$(topic_name) multi_id=$(multi_id)",
+    )
     msg_id = subs_by_name[key]
 
     haskey(fmts, String(topic_name)) || error("No FORMAT definition found for topic=$(topic_name)")
@@ -1192,12 +1402,26 @@ function read_topic(path::AbstractString, topic_name::AbstractString, multi_id::
     return TopicData(String(topic_name), UInt8(multi_id), ts, cols)
 end
 
-function audit_data_lengths(path::AbstractString, topic_name::AbstractString, multi_id::Integer=0; max_hits::Int=200)
+"""
+    audit_data_lengths(path, topic_name, multi_id = 0; max_hits = 200)
+
+Print observed and expected `DATA` payload lengths for a topic and return
+`((bytes_without_final_padding, bytes_with_final_padding), observed_counts)`.
+At most `max_hits` samples are inspected.
+"""
+function audit_data_lengths(
+    path::AbstractString,
+    topic_name::AbstractString,
+    multi_id::Integer = 0;
+    max_hits::Int = 200,
+)
     fmts = read_all_formats(path)
     _, subs_by_name = read_all_subscriptions(path)
 
     key = (String(topic_name), UInt8(multi_id))
-    haskey(subs_by_name, key) || error("No subscription for topic=$(topic_name) multi_id=$(multi_id)")
+    haskey(subs_by_name, key) || error(
+        "No subscription for topic=$(topic_name) multi_id=$(multi_id)",
+    )
     msg_id = subs_by_name[key]
 
     haskey(fmts, String(topic_name)) || error("No FORMAT definition found for topic=$(topic_name)")
@@ -1238,6 +1462,14 @@ end
 # ULog object API
 # -----------------------------------------------------------------------------
 
+"""
+    ULog(path)
+
+Open a standard ULog file and eagerly read its header, validated format graph, topic
+subscriptions, and metadata. Topic `DATA` records remain on disk until [`read_topic`](@ref)
+is called. Invalid headers, unsupported incompatibility flags, malformed formats, and
+malformed metadata throw an `ErrorException`.
+"""
 struct ULog
     path::String
     header::ULogHeader
@@ -1259,25 +1491,67 @@ function ULog(path::AbstractString)
     return ULog(p, hdr, fmts, subs_by_id, subs_by_name, metadata)
 end
 
+"""
+    info_messages(ulog) -> Dict{String,Any}
+
+Return the mutable dictionary of decoded `INFO` values.
+"""
 info_messages(ulog::ULog) = ulog.metadata.info
 
+"""
+    info_types(ulog) -> Dict{String,String}
+
+Return the mutable dictionary mapping `INFO` keys to their original ULog type strings.
+"""
 info_types(ulog::ULog) = ulog.metadata.info_types
 
+"""
+    info_multiple(ulog) -> Dict{String,Vector{Vector{Any}}}
+
+Return grouped `INFO_MULTIPLE` chunks. Each outer entry is a logical message and each
+inner vector contains its continued chunks. The returned dictionary is mutable.
+"""
 info_multiple(ulog::ULog) = ulog.metadata.info_multiple
 
+"""
+    info_message(ulog, key; default = nothing)
+
+Return one decoded `INFO` value, or `default` when `key` is absent.
+"""
 info_message(ulog::ULog, key::AbstractString; default=nothing) =
     get(ulog.metadata.info, String(key), default)
 
+"""
+    initial_parameters(ulog) -> Dict{String,Any}
+
+Return the mutable dictionary of parameters recorded before the data section.
+"""
 initial_parameters(ulog::ULog) = ulog.metadata.initial_parameters
 
+"""
+    changed_parameters(ulog) -> Vector{ParameterChange}
+
+Return parameter updates recorded after the data section starts. The vector is mutable
+and remains in file order.
+"""
 changed_parameters(ulog::ULog) = ulog.metadata.changed_parameters
 
 function default_parameter_index(which::Symbol)::Int
     which === :system && return 0
     which === :current_setup && return 1
-    error("Unknown default parameter set: $which. Use :system, :current_setup, or an integer bit index.")
+    error(
+        "Unknown default parameter set: $which. Use :system, :current_setup, " *
+        "or an integer bit index.",
+    )
 end
 
+"""
+    default_parameters(ulog, which = :system) -> Dict{String,Any}
+
+Return default parameter values for `:system`, `:current_setup`, or an integer bit
+index. An absent set returns a new empty dictionary. Unknown symbols throw an
+`ErrorException`.
+"""
 function default_parameters(ulog::ULog, which::Symbol=:system)
     return default_parameters(ulog, default_parameter_index(which))
 end
@@ -1286,9 +1560,20 @@ function default_parameters(ulog::ULog, which::Integer)
     return get(ulog.metadata.default_parameters, Int(which), Dict{String, Any}())
 end
 
+"""
+    has_default_parameters(ulog) -> Bool
+
+Return whether the log advertises or contains default parameter records.
+"""
 has_default_parameters(ulog::ULog) =
     ulog.metadata.has_default_parameters || !isempty(ulog.metadata.default_parameters)
 
+"""
+    logged_messages(ulog; tag = nothing) -> Vector{LoggedMessage}
+
+Return logged strings in file order. Supplying `tag` returns a new vector containing
+only matching tagged messages; without a tag, the metadata's mutable vector is returned.
+"""
 function logged_messages(ulog::ULog; tag=nothing)
     msgs = ulog.metadata.logged_messages
     tag === nothing && return msgs
@@ -1296,6 +1581,11 @@ function logged_messages(ulog::ULog; tag=nothing)
     return [msg for msg in msgs if msg.tag == tag_value]
 end
 
+"""
+    topics(ulog) -> Vector{Tuple{String,UInt8}}
+
+Return all subscribed `(topic_name, multi_id)` pairs in deterministic sorted order.
+"""
 function topics(ulog::ULog)
     ks = collect(keys(ulog.subs_by_name))
     sort!(ks; by = x -> (x[1], x[2]))
@@ -1317,10 +1607,14 @@ end
 
 function read_topic(ulog::ULog, topic_name::AbstractString, multi_id::Integer=0)
     key = (String(topic_name), UInt8(multi_id))
-    haskey(ulog.subs_by_name, key) || error("No subscription for topic=$(topic_name) multi_id=$(multi_id)")
+    haskey(ulog.subs_by_name, key) || error(
+        "No subscription for topic=$(topic_name) multi_id=$(multi_id)",
+    )
     msg_id = ulog.subs_by_name[key]
 
-    haskey(ulog.formats, String(topic_name)) || error("No FORMAT definition found for topic=$(topic_name)")
+    haskey(ulog.formats, String(topic_name)) || error(
+        "No FORMAT definition found for topic=$(topic_name)",
+    )
     fmt = ulog.formats[String(topic_name)]
 
     N = count_data_samples(ulog, msg_id)
@@ -1360,6 +1654,12 @@ function read_topic(ulog::ULog, topic_name::AbstractString, multi_id::Integer=0)
     return TopicData(String(topic_name), UInt8(multi_id), ts, cols)
 end
 
+"""
+    build_data_index(ulog) -> Dict{UInt16,Vector{Int64}}
+
+Scan a log once and return zero-based file offsets for every `DATA` message identifier.
+Use the result with indexed [`read_topic`](@ref) calls to avoid repeated full scans.
+"""
 function build_data_index(ulog::ULog)
     index = Dict{UInt16, Vector{Int64}}()
     open(ulog.path, "r") do io
@@ -1375,12 +1675,21 @@ function build_data_index(ulog::ULog)
     return index
 end
 
-function read_topic(ulog::ULog, topic_name::AbstractString, multi_id::Integer, index::Dict{UInt16, Vector{Int64}})
+function read_topic(
+    ulog::ULog,
+    topic_name::AbstractString,
+    multi_id::Integer,
+    index::Dict{UInt16, Vector{Int64}},
+)
     key = (String(topic_name), UInt8(multi_id))
-    haskey(ulog.subs_by_name, key) || error("No subscription for topic=$(topic_name) multi_id=$(multi_id)")
+    haskey(ulog.subs_by_name, key) || error(
+        "No subscription for topic=$(topic_name) multi_id=$(multi_id)",
+    )
     msg_id = ulog.subs_by_name[key]
 
-    haskey(ulog.formats, String(topic_name)) || error("No FORMAT definition found for topic=$(topic_name)")
+    haskey(ulog.formats, String(topic_name)) || error(
+        "No FORMAT definition found for topic=$(topic_name)",
+    )
     fmt = ulog.formats[String(topic_name)]
 
     offsets = get(index, msg_id, Int64[])
@@ -1394,8 +1703,12 @@ function read_topic(ulog::ULog, topic_name::AbstractString, multi_id::Integer, i
         for (k, off) in enumerate(offsets)
             seek(io, off)
             msg = read_message_at!(io)
-            msg.type == UInt8('D') || error("Index corruption: offset $off not DATA (type=$(Char(msg.type)))")
-            data_msg_id(msg) == msg_id || error("Index corruption: DATA at offset $off has wrong msg_id")
+            msg.type == UInt8('D') || error(
+                "Index corruption: offset $off not DATA (type=$(Char(msg.type)))",
+            )
+            data_msg_id(msg) == msg_id || error(
+                "Index corruption: DATA at offset $off has wrong msg_id",
+            )
 
             p = msg.payload
             omit_final_padding = final_padding_omitted(
@@ -1441,9 +1754,18 @@ end
 
 Base.getindex(td::TopicData, name::Symbol) = getproperty(td, name)
 
+"""
+    time_seconds(td; t0_us = nothing) -> Vector{Float64}
+    time_seconds(td, ulog) -> Vector{Float64}
+
+Convert topic timestamps from microseconds to seconds relative to the first sample, an
+explicit `t0_us`, or the ULog start timestamp. Empty timestamp columns return an empty
+`Float64` vector. Topics without a timestamp field throw an `ErrorException`.
+"""
 function time_seconds(td::TopicData; t0_us::Union{UInt64,Nothing}=nothing)
     ts = td.timestamp
     ts === nothing && error("Topic has no :timestamp field")
+    isempty(ts) && return Float64[]
     t0 = t0_us === nothing ? ts[1] : t0_us
     return (Float64.(ts) .- Float64(t0)) .* 1e-6
 end

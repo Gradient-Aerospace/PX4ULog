@@ -1,229 +1,155 @@
 # PX4ULog.jl
 
-PX4ULog.jl is a Julia package for reading and decoding PX4 ULog (`.ulg`) flight log files.
+PX4ULog.jl reads and decodes standard PX4 ULog (`.ulg`) flight logs in Julia. It
+provides typed, column-oriented topic data together with information messages,
+parameters, and logged strings for post-flight analysis and debugging.
 
-The focus of the package is:
-- correctness on real PX4 logs
-- predictable, efficient data access
-- minimal dependencies
-- a clear separation between parsing and analysis
+## Requirements
 
-It is intended for post-flight analysis, debugging, plotting, and research workflows.
-
----
-
-## Features
-
-- Reads ULog headers and message records
-- Parses FORMAT (`F`) and ADD_LOGGED_MSG (`A`) definitions
-- Decodes metadata, parameters, default parameters, and logged strings
-- Decodes DATA (`D`) messages into typed Julia data
-- Column-oriented storage for efficient access
-- Supports nested FORMAT definitions by flattening nested field paths
-- Supports multi-instance topics (`multi_id`)
-- Optional integration with DataFrames.jl (via extension)
-- No required dependencies beyond Julia itself
-
----
+PX4ULog requires Julia 1.12 or later. The core package depends only on Julia standard
+libraries. DataFrames.jl support is provided through an optional package extension.
 
 ## Installation
 
-For development:
+PX4ULog is currently installed directly from GitHub:
 
 ```julia
-pkg> dev path/to/PX4ULog
+using Pkg
+Pkg.add(url = "https://github.com/Gradient-Aerospace/PX4ULog.git")
 ```
 
-Once registered:
+For local development:
 
 ```julia
-pkg> add PX4ULog
+using Pkg
+Pkg.develop(path = "/path/to/PX4ULog")
 ```
 
-Optional DataFrames support:
+Install DataFrames.jl separately to enable `to_dataframe`:
 
 ```julia
-pkg> add DataFrames
+Pkg.add("DataFrames")
 ```
 
-DataFrames is a weak dependency and is only loaded if present.
-
----
-
-## Basic usage
-
-### Open a log file
+## Reading A Log
 
 ```julia
 using PX4ULog
 
 ulog = PX4ULog.ULog("flight.ulg")
-```
-
-This reads:
-- the ULog header
-- all FORMAT definitions
-- all topic subscriptions
-- INFO and INFO_MULTIPLE metadata
-- initial/default parameters and later parameter changes
-- logged string messages
-
-No DATA messages are decoded at this stage.
-
----
-
-### List available topics
-
-```julia
 PX4ULog.topics(ulog)
 ```
 
-Returns a list of `(topic_name, multi_id)` pairs.
+Construction reads and validates the header, format graph, subscriptions, information
+messages, parameters, and logged strings. Topic samples remain on disk until requested.
 
----
-
-### Read a topic
+Decode one topic instance:
 
 ```julia
-att = PX4ULog.read_topic(ulog, "vehicle_attitude", 0)
+attitude = PX4ULog.read_topic(ulog, "vehicle_attitude", 0)
+
+attitude.timestamp  # microseconds
+attitude.q          # N x 4 matrix
+attitude[:q]        # equivalent symbol indexing
 ```
 
-This decodes all samples for the given topic and returns a `TopicData` object.
+Scalar fields are vectors, fixed-size arrays are `N x array_length` matrices, character
+arrays are strings, and nested field names are flattened with underscores. Multi-instance
+topics are selected with `multi_id`.
 
----
+For repeated extraction, scan data offsets once:
 
-### Read metadata and parameters
+```julia
+index = PX4ULog.build_data_index(ulog)
+attitude = PX4ULog.read_topic(ulog, "vehicle_attitude", 0, index)
+```
+
+## Time
+
+Topic timestamps are stored in microseconds. Convert them to seconds relative to the
+topic's first sample:
+
+```julia
+t_s = PX4ULog.time_seconds(attitude)
+```
+
+An explicit origin or the log start time can also be used:
+
+```julia
+t_s = PX4ULog.time_seconds(attitude; t0_us = UInt64(1_000_000))
+t_s = PX4ULog.time_seconds(attitude, ulog)
+```
+
+Empty topics produce empty timestamp, column, and time vectors.
+
+## Metadata And Parameters
+
+Metadata is available immediately after constructing `ULog`:
 
 ```julia
 PX4ULog.info_message(ulog, "camera_model")
-PX4ULog.info_message(ulog, "camera_serial_number")
-PX4ULog.initial_parameters(ulog)["AIRCRAFT_ID"]
-PX4ULog.logged_messages(ulog)
-```
-
-Other metadata helpers include:
-
-```julia
+PX4ULog.info_message(ulog, "camera_serial_number"; default = "unknown")
 PX4ULog.info_messages(ulog)
 PX4ULog.info_types(ulog)
 PX4ULog.info_multiple(ulog)
+
+PX4ULog.initial_parameters(ulog)["AIRCRAFT_ID"]
 PX4ULog.changed_parameters(ulog)
+PX4ULog.has_default_parameters(ulog)
 PX4ULog.default_parameters(ulog, :system)
 PX4ULog.default_parameters(ulog, :current_setup)
-PX4ULog.has_default_parameters(ulog)
+
+PX4ULog.logged_messages(ulog)
+PX4ULog.logged_messages(ulog; tag = 42)
 ```
 
-`logged_messages(ulog; tag=...)` filters tagged log messages by tag.
+Known scalar metadata values are decoded to native Julia values. Character arrays become
+strings. Other fixed-size arrays and unknown vendor types are retained as raw
+`Vector{UInt8}` values so their bytes remain available without package-specific decoding.
 
----
+## DataFrames
 
-## TopicData
-
-Decoded data is stored in a `TopicData` struct:
-
-```julia
-TopicData(
-    topic::String,
-    multi_id::UInt8,
-    timestamp::Union{Vector{UInt64}, Nothing},
-    cols::Dict{Symbol, Any}
-)
-```
-
-- Scalar fields are stored as vectors
-- Fixed-size array fields are stored as matrices (`N × array_length`)
-- Nested fields are flattened with underscore-separated names
-- Padding fields are consumed where serialized and are not exposed as columns
-
-For example, a nested field such as `position_setpoint current` is exposed as
-columns like `current_lat`, `current_lon`, and `current_timestamp`. Arrays of
-nested structs are stored as matrices with one column per nested instance.
-
-### Accessing data
-
-Columns can be accessed as properties:
-
-```julia
-att.q
-att.timestamp
-att.quat_reset_counter
-```
-
-or via indexing:
-
-```julia
-att[:q]
-```
-
----
-
-### Time helper
-
-```julia
-t = PX4ULog.time_seconds(att)
-```
-
-Returns time in seconds relative to the first timestamp in the topic.
-
----
-
-## DataFrames integration (optional)
-
-If `DataFrames.jl` is installed, a conversion helper is available:
+After loading DataFrames.jl, decoded topics can be converted without making DataFrames a
+core dependency:
 
 ```julia
 using DataFrames
 
-df = PX4ULog.to_dataframe(att; time_s=true)
+df = PX4ULog.to_dataframe(attitude; time_s = true)
 ```
 
-### Array handling
+Fixed-size arrays use one DataFrame column per element by default. Other representations
+are selected with `expand_arrays = :rowviews` or `expand_arrays = :vectors`.
 
-By default, array fields are expanded into multiple columns:
+## Validation And Limitations
 
-```text
-q_1, q_2, q_3, q_4
+PX4ULog rejects invalid magic bytes, unsupported incompatibility flags, unknown or cyclic
+nested formats, malformed known metadata values, and topic payloads that do not match
+their declared format. A partial final record is discarded as required by ULog, but the
+parser does not resynchronize after arbitrary mid-file corruption.
+
+The package currently targets standard ULog framing. PX4 event metadata is exposed as raw
+topic or information data rather than expanded into high-level event objects.
+
+## Performance
+
+Topic decoding uses a count pass followed by preallocation and a decode pass. Numeric
+scalar and array fields are written directly into their destination columns. Character
+array fields allocate one `String` per decoded sample. `build_data_index` avoids repeated
+full-file scans when several topics will be extracted from the same log.
+
+## Testing
+
+Run the synthetic parser and DataFrames test suite with:
+
+```sh
+julia --project=. -e 'import Pkg; Pkg.test()'
 ```
 
-This can be configured:
-
-```julia
-PX4ULog.to_dataframe(att; expand_arrays=:columns)
-PX4ULog.to_dataframe(att; expand_arrays=:rowviews)
-PX4ULog.to_dataframe(att; expand_arrays=:vectors)
-```
-
----
-
-## Performance notes
-
-- DATA decoding uses a two-pass approach:
-  1. count samples
-  2. preallocate and decode
-- No per-row allocations during decoding
-- Array fields are stored as matrices, not vectors of vectors
-- Repeated topic reads can use `build_data_index(ulog)` to avoid rescanning
-- Suitable for large logs and repeated topic extraction
-
----
-
-## Design notes
-
-- The core package does not depend on DataFrames
-- No Tables.jl interface is provided (by design, for now)
-- The API exposes structured data directly rather than hiding it behind abstractions
-- The goal is to be predictable and easy to reason about
-
----
-
-## Limitations
-
-- PX4 event metadata is not yet expanded into high-level event objects
-- Abruptly truncated final messages are discarded, but full resynchronization
-  after arbitrary mid-file corruption is not implemented
-
----
+The tests cover primitive wire types, nested and forward-referenced formats, padding,
+multi-instance and empty topics, metadata, malformed records, compatibility flags, and
+truncated final records.
 
 ## License
 
-MIT
+PX4ULog.jl is available under the [MIT License](LICENSE).

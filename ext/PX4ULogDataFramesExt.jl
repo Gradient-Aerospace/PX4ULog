@@ -39,8 +39,7 @@ function PX4ULog.to_dataframe(
     if include_timestamp && td.timestamp !== nothing
         df[!, timestamp_name] = copycols ? copy(td.timestamp) : td.timestamp
         if time_s
-            t0 = t0_us === nothing ? td.timestamp[1] : t0_us
-            df[!, :t] = (Float64.(td.timestamp) .- Float64(t0)) .* 1e-6
+            df[!, :t] = PX4ULog.time_seconds(td; t0_us = t0_us)
         end
     elseif time_s
         error("time_s=true requested but TopicData has no :timestamp")

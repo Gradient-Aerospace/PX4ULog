@@ -1,0 +1,7 @@
+Manifest.toml
+.DS_Store
+.vscode/
+*.cov
+*.mem
+coverage/
+lcov.info
