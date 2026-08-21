@@ -40,7 +40,7 @@ function to_dataframe end
 """
     to_timeseries(td::TopicData, ulog::ULog; kwargs...)
     to_timeseries(td::TopicData; t0_us, kwargs...)
-    to_timeseries(ulog::ULog, topic_name, multi_id = 0; index = nothing, kwargs...)
+    to_timeseries(ulog::ULog, topic_name, multi_id = 0; kwargs...)
 
 Convert decoded topic data to a discrete `TimeSeries` of `NamedTuple` messages. Methods
 are provided by the optional SystemsOfSystems extension after SystemsOfSystems.jl is
@@ -1336,7 +1336,7 @@ end
 end
 
 """
-    count_data_samples(path_or_ulog, msg_id) -> Int
+    count_data_samples(path, msg_id) -> Int
 
 Count complete `DATA` records for one message identifier. This scans the log once and
 does not decode the samples.
@@ -1355,13 +1355,15 @@ function count_data_samples(path::AbstractString, msg_id::UInt16)
 end
 
 """
-    read_topic(path_or_ulog, topic_name, multi_id = 0) -> TopicData
+    read_topic(path, topic_name, multi_id = 0) -> TopicData
+    read_topic(ulog, topic_name, multi_id = 0) -> TopicData
     read_topic(ulog, topic_name, multi_id, index) -> TopicData
 
 Decode all samples for one topic instance into preallocated, column-oriented storage.
-The non-indexed overload performs a count pass followed by a decode pass. The indexed
-overload uses offsets from [`build_data_index`](@ref). Missing subscriptions, malformed
-formats, and invalid data payload lengths throw an `ErrorException`.
+The path overload performs a count pass followed by a decode pass. A `ULog` lazily builds
+and reuses a data index, while the explicit indexed overload uses the supplied offsets.
+Missing subscriptions, malformed formats, and invalid data payload lengths throw an
+`ErrorException`.
 """
 function read_topic(path::AbstractString, topic_name::AbstractString, multi_id::Integer=0)
     fmts = read_all_formats(path)
@@ -1474,13 +1476,24 @@ end
 # ULog object API
 # -----------------------------------------------------------------------------
 
+const DataIndex = Dict{UInt16, Vector{Int64}}
+
+mutable struct ULogCache
+    data_index::Union{Nothing, DataIndex}
+    lock::ReentrantLock
+end
+
+ULogCache() = ULogCache(nothing, ReentrantLock())
+
 """
     ULog(path)
 
-Open a standard ULog file and eagerly read its header, validated format graph, topic
-subscriptions, and metadata. Topic `DATA` records remain on disk until [`read_topic`](@ref)
-is called. Invalid headers, unsupported incompatibility flags, malformed formats, and
-malformed metadata throw an `ErrorException`.
+Open a complete, unchanged ULog file and eagerly read its header, validated format graph,
+topic subscriptions, and metadata. Topic `DATA` records remain on disk until
+[`read_topic`](@ref) is called. The first topic read builds a data index that subsequent
+reads reuse. Modifying the file after constructing `ULog` invalidates its parsed metadata
+and cached data offsets. Invalid headers, unsupported incompatibility flags, malformed
+formats, and malformed metadata throw an `ErrorException`.
 """
 struct ULog
     path::String
@@ -1489,6 +1502,7 @@ struct ULog
     subs_by_id::Dict{UInt16, Subscription}
     subs_by_name::Dict{Tuple{String,UInt8}, UInt16}
     metadata::ULogMetadata
+    cache::ULogCache
 end
 
 function ULog(path::AbstractString)
@@ -1500,7 +1514,7 @@ function ULog(path::AbstractString)
     fmts = read_all_formats(p)
     subs_by_id, subs_by_name = read_all_subscriptions(p)
     metadata = read_all_metadata(p, fmts, subs_by_id)
-    return ULog(p, hdr, fmts, subs_by_id, subs_by_name, metadata)
+    return ULog(p, hdr, fmts, subs_by_id, subs_by_name, metadata, ULogCache())
 end
 
 """
@@ -1604,66 +1618,8 @@ function topics(ulog::ULog)
     return ks
 end
 
-function count_data_samples(ulog::ULog, msg_id::UInt16)
-    n = 0
-    open(ulog.path, "r") do io
-        _ = read_ulog_preamble!(io)
-        for msg in each_message(io)
-            if msg.type == UInt8('D') && data_msg_id(msg) == msg_id
-                n += 1
-            end
-        end
-    end
-    return n
-end
-
 function read_topic(ulog::ULog, topic_name::AbstractString, multi_id::Integer=0)
-    key = (String(topic_name), UInt8(multi_id))
-    haskey(ulog.subs_by_name, key) || error(
-        "No subscription for topic=$(topic_name) multi_id=$(multi_id)",
-    )
-    msg_id = ulog.subs_by_name[key]
-
-    haskey(ulog.formats, String(topic_name)) || error(
-        "No FORMAT definition found for topic=$(topic_name)",
-    )
-    fmt = ulog.formats[String(topic_name)]
-
-    N = count_data_samples(ulog, msg_id)
-    cols, ts = init_columns_prealloc(fmt, ulog.formats, N)
-
-    expected_omitted = expected_struct_bytes(fmt, ulog.formats)
-    expected_full = full_struct_bytes(fmt, ulog.formats)
-
-    k = 0
-    open(ulog.path, "r") do io
-        _ = read_ulog_preamble!(io)
-        for msg in each_message(io)
-            if msg.type == UInt8('D') && data_msg_id(msg) == msg_id
-                k += 1
-                p = msg.payload
-                omit_final_padding = final_padding_omitted(
-                    length(p) - 2,
-                    expected_omitted,
-                    expected_full,
-                    topic_name,
-                    length(p),
-                )
-                decode_data_into_columns_at!(
-                    fmt,
-                    ulog.formats,
-                    p,
-                    k,
-                    ts,
-                    cols;
-                    omit_final_padding=omit_final_padding,
-                )
-            end
-        end
-    end
-
-    k == N || error("Internal: counted N=$N samples but decoded k=$k")
-    return TopicData(String(topic_name), UInt8(multi_id), ts, cols)
+    return read_topic(ulog, topic_name, multi_id, cached_data_index(ulog))
 end
 
 """
@@ -1673,7 +1629,7 @@ Scan a log once and return zero-based file offsets for every `DATA` message iden
 Use the result with indexed [`read_topic`](@ref) calls to avoid repeated full scans.
 """
 function build_data_index(ulog::ULog)
-    index = Dict{UInt16, Vector{Int64}}()
+    index = DataIndex()
     open(ulog.path, "r") do io
         _ = read_ulog_preamble!(io)
         for msg in each_message(io)
@@ -1685,6 +1641,21 @@ function build_data_index(ulog::ULog)
         end
     end
     return index
+end
+
+function cached_data_index(ulog::ULog)
+
+    return lock(ulog.cache.lock) do
+
+        index = ulog.cache.data_index
+        if isnothing(index)
+            index = build_data_index(ulog)
+            ulog.cache.data_index = index
+        end
+        return index
+
+    end
+
 end
 
 function read_topic(

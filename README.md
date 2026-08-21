@@ -58,11 +58,12 @@ Scalar fields are vectors, fixed-size arrays are `N x array_length` matrices, ch
 arrays are strings, and nested field names are flattened with underscores. Multi-instance
 topics are selected with `multi_id`.
 
-For repeated extraction, scan data offsets once:
+The first topic read builds a data index. Later reads from the same `ULog` reuse it
+automatically:
 
 ```julia
-index = PX4ULog.build_data_index(ulog)
-attitude = PX4ULog.read_topic(ulog, "vehicle_attitude", 0, index)
+attitude = PX4ULog.read_topic(ulog, "vehicle_attitude", 0)
+position = PX4ULog.read_topic(ulog, "vehicle_local_position", 0)
 ```
 
 ## Time
@@ -92,12 +93,10 @@ represented by `SVector`s.
 ```julia
 using SystemsOfSystems
 
-index = PX4ULog.build_data_index(ulog)
 position_messages_ts = PX4ULog.to_timeseries(
     ulog,
     "vehicle_local_position",
-    0;
-    index,
+    0,
 )
 
 vx_ts = select(
@@ -112,7 +111,7 @@ The ULog start timestamp provides a common time origin, preserving the actual ti
 between topics. Previously decoded data can be converted with the same origin:
 
 ```julia
-position = PX4ULog.read_topic(ulog, "vehicle_local_position", 0, index)
+position = PX4ULog.read_topic(ulog, "vehicle_local_position", 0)
 position_messages_ts = PX4ULog.to_timeseries(position, ulog)
 ```
 
@@ -180,10 +179,9 @@ topic or information data rather than expanded into high-level event objects.
 
 ## Performance
 
-Topic decoding uses a count pass followed by preallocation and a decode pass. Numeric
-scalar and array fields are written directly into their destination columns. Character
-array fields allocate one `String` per decoded sample. `build_data_index` avoids repeated
-full-file scans when several topics will be extracted from the same log.
+The first topic read indexes the log and later reads reuse those data offsets. Numeric
+scalar and array fields are written directly into preallocated destination columns.
+Character array fields allocate one `String` per decoded sample.
 
 ## Testing
 

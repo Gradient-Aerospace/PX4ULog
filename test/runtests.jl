@@ -303,8 +303,12 @@ end
 
         @test ulog.header.magic_ok
         @test PX4ULog.topics(ulog) == [("outer", UInt8(0))]
+        @test isnothing(ulog.cache.data_index)
 
+        # The first topic read builds the index owned by this ULog.
         td = PX4ULog.read_topic(ulog, "outer", 0)
+        cached_index = ulog.cache.data_index
+        @test !isnothing(cached_index)
         @test td.timestamp == UInt64[2_000_000]
         @test sort(collect(keys(td.cols)); by = String) == [:inner_a, :inner_b]
         @test td.inner_a == reshape(UInt16[0x1234, 0x5678], 1, 2)
@@ -312,10 +316,12 @@ end
         @test PX4ULog.time_seconds(td) == [0.0]
         @test PX4ULog.time_seconds(td, ulog) == [1.0]
 
-        index = PX4ULog.build_data_index(ulog)
-        indexed = PX4ULog.read_topic(ulog, "outer", 0, index)
+        # Explicit low-level indexing remains equivalent to the cached reader.
+        explicit_index = PX4ULog.build_data_index(ulog)
+        indexed = PX4ULog.read_topic(ulog, "outer", 0, explicit_index)
         @test indexed.inner_a == td.inner_a
         @test indexed.inner_b == td.inner_b
+        @test ulog.cache.data_index === cached_index
 
         df = PX4ULog.to_dataframe(td; time_s = true)
         @test names(df) == [
@@ -348,10 +354,11 @@ end
         @test td.inner_a == reshape(UInt16[0x1234, 0x5678], 1, 2)
         @test td.inner_b == reshape(UInt8[0x42, 0x24], 1, 2)
 
-        # Direct reading and explicit time origins use the same conversion path.
-        direct_ts = PX4ULog.to_timeseries(ulog, "outer", 0; index)
+        # Direct reading reuses the cached index and the common ULog time origin.
+        direct_ts = PX4ULog.to_timeseries(ulog, "outer", 0)
         @test direct_ts.time == ts.time
         @test direct_ts.data == ts.data
+        @test ulog.cache.data_index === cached_index
 
         explicit_origin_ts = PX4ULog.to_timeseries(
             td;
@@ -370,6 +377,21 @@ end
             dimensions = ["First value" => "", "Second value" => ""],
         )
         @test inner_a_ts.data == SVector{2,UInt16}[SVector(0x1234, 0x5678)]
+
+        # Cache ownership and first-read initialization are local to each ULog object.
+        other_ulog = PX4ULog.ULog(path)
+        @test isnothing(other_ulog.cache.data_index)
+        @test PX4ULog.cached_data_index(other_ulog) !== cached_index
+
+        # Concurrent first reads all receive the one index installed in the cache.
+        concurrent_ulog = PX4ULog.ULog(path)
+        tasks = [
+            Threads.@spawn(PX4ULog.cached_data_index(concurrent_ulog))
+            for _ in 1:4
+        ]
+        concurrent_indexes = fetch.(tasks)
+        @test all(index -> index === concurrent_indexes[1], concurrent_indexes)
+        @test concurrent_ulog.cache.data_index === concurrent_indexes[1]
     end
 end
 

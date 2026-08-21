@@ -130,13 +130,10 @@ function PX4ULog.to_timeseries(
     ulog::PX4ULog.ULog,
     topic_name::AbstractString,
     multi_id::Integer = 0;
-    index = nothing,
     kwargs...,
 )
 
-    topic = isnothing(index) ?
-        PX4ULog.read_topic(ulog, topic_name, multi_id) :
-        PX4ULog.read_topic(ulog, topic_name, multi_id, index)
+    topic = PX4ULog.read_topic(ulog, topic_name, multi_id)
     return PX4ULog.to_timeseries(topic, ulog; kwargs...)
 
 end
