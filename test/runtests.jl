@@ -57,6 +57,7 @@ function fixed_string_bytes(value::AbstractString, len::Int)
 end
 
 function typed_value_payload(ulog_type::AbstractString, value)
+
     match_result = match(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?$", ulog_type)
     match_result === nothing && error("Invalid test ULog type: $ulog_type")
     base_type = String(match_result.captures[1])
@@ -77,6 +78,7 @@ function typed_value_payload(ulog_type::AbstractString, value)
     bytes = UInt8[]
     push_le!(bytes, value)
     return bytes
+
 end
 
 function typed_key_value_payload_raw(
@@ -212,6 +214,7 @@ function data_payload(msg_id::UInt16, values...)
 end
 
 function nested_data_payload()
+
     bytes = UInt8[]
     push_le!(bytes, UInt16(0))
     push_le!(bytes, UInt64(2_000_000))
@@ -227,9 +230,11 @@ function nested_data_payload()
     push!(bytes, 0x24)
     push!(bytes, 0xdd)
     return bytes
+
 end
 
 function nested_records(; include_metadata::Bool = false)
+
     records = Tuple{Char, Vector{UInt8}}[]
     if include_metadata
         push!(records, ('I', typed_key_value_payload(
@@ -285,6 +290,7 @@ function nested_records(; include_metadata::Bool = false)
     push!(records, ('R', UInt8[0x00, 0x00]))
     push!(records, ('X', UInt8[0xde, 0xad]))
     return records
+
 end
 
 function error_text(f)
