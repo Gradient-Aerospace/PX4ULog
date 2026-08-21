@@ -17,7 +17,7 @@ export initial_parameters, changed_parameters, default_parameters, has_default_p
 export logged_messages
 export time_seconds
 export audit_data_lengths
-export to_dataframe
+export to_dataframe, to_timeseries
 
 using Printf
 
@@ -36,6 +36,18 @@ Set `time_s = true` to add time in seconds and use `expand_arrays` to select
 `:columns`, `:rowviews`, or `:vectors` for fixed-size array fields.
 """
 function to_dataframe end
+
+"""
+    to_timeseries(td::TopicData, ulog::ULog; kwargs...)
+    to_timeseries(td::TopicData; t0_us, kwargs...)
+    to_timeseries(ulog::ULog, topic_name, multi_id = 0; index = nothing, kwargs...)
+
+Convert decoded topic data to a discrete `TimeSeries` of `NamedTuple` messages. Methods
+are provided by the optional SystemsOfSystems extension after SystemsOfSystems.jl is
+loaded. Message timestamps are expressed in seconds relative to the ULog start or the
+explicit `t0_us` origin.
+"""
+function to_timeseries end
 
 # -----------------------------------------------------------------------------
 # Types

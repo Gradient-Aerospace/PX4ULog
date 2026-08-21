@@ -7,7 +7,8 @@ parameters, and logged strings for post-flight analysis and debugging.
 ## Requirements
 
 PX4ULog requires Julia 1.12 or later. The core package depends only on Julia standard
-libraries. DataFrames.jl support is provided through an optional package extension.
+libraries. DataFrames.jl and SystemsOfSystems.jl support is provided through optional
+package extensions.
 
 ## Installation
 
@@ -81,6 +82,52 @@ t_s = PX4ULog.time_seconds(attitude, ulog)
 ```
 
 Empty topics produce empty timestamp, column, and time vectors.
+
+## TimeSeries
+
+After loading SystemsOfSystems.jl, a complete topic can be converted to a discrete
+`TimeSeries`. Each sample is a concrete `NamedTuple`, and fixed-size array fields are
+represented by `SVector`s.
+
+```julia
+using SystemsOfSystems
+
+index = PX4ULog.build_data_index(ulog)
+position_messages_ts = PX4ULog.to_timeseries(
+    ulog,
+    "vehicle_local_position",
+    0;
+    index,
+)
+
+vx_ts = select(
+    position_messages_ts,
+    :vx;
+    title = "North Velocity",
+    dimensions = ["North velocity" => "m/s"],
+)
+```
+
+The ULog start timestamp provides a common time origin, preserving the actual timing
+between topics. Previously decoded data can be converted with the same origin:
+
+```julia
+position = PX4ULog.read_topic(ulog, "vehicle_local_position", 0, index)
+position_messages_ts = PX4ULog.to_timeseries(position, ulog)
+```
+
+When no `ULog` is available, the origin must be explicit:
+
+```julia
+position_messages_ts = PX4ULog.to_timeseries(
+    position;
+    t0_us = UInt64(1_000_000),
+)
+```
+
+ULog records describe fixed array lengths but not higher-level meaning. PX4ULog therefore
+does not infer that an array represents a quaternion, matrix, or physical vector. Analyses
+can make those domain-specific conversions explicitly.
 
 ## Metadata And Parameters
 
