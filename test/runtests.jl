@@ -322,6 +322,12 @@ end
         @test PX4ULog.time_seconds(td) == [0.0]
         @test PX4ULog.time_seconds(td, ulog) == [1.0]
 
+        # The path overload performs its own count pass before decoding. Compare it with
+        # the cached ULog reader so this internal preallocation path remains covered.
+        path_topic = PX4ULog.read_topic(path, "outer", 0)
+        @test path_topic.timestamp == td.timestamp
+        @test path_topic.cols == td.cols
+
         # Explicit low-level indexing remains equivalent to the cached reader.
         explicit_index = PX4ULog.build_data_index(ulog)
         indexed = PX4ULog.read_topic(ulog, "outer", 0, explicit_index)

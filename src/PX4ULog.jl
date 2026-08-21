@@ -9,7 +9,7 @@ module PX4ULog
 export ULogHeader, ULogMessage, read_ulog_header, each_message, scan_messages
 export FieldDef, FormatDef, scan_formats, read_all_formats, parse_format_string
 export Subscription, scan_subscriptions, read_all_subscriptions
-export TopicData, read_topic, count_data_samples
+export TopicData, read_topic
 export ULog, topics, build_data_index
 export ULogMetadata, ParameterChange, LoggedMessage
 export info_messages, info_message, info_types, info_multiple
@@ -1378,13 +1378,8 @@ end
     return UInt16(p[1]) | (UInt16(p[2]) << 8)
 end
 
-"""
-    count_data_samples(path, msg_id) -> Int
-
-Count complete `DATA` records for one message identifier. This scans the log once and
-does not decode the samples.
-"""
-function count_data_samples(path::AbstractString, msg_id::UInt16)
+# Count complete DATA records to preallocate storage for the path-based topic reader.
+function _count_data_samples(path::AbstractString, msg_id::UInt16)
     n = 0
     open(path, "r") do io
         _ = read_ulog_preamble!(io)
@@ -1422,7 +1417,7 @@ function read_topic(path::AbstractString, topic_name::AbstractString, multi_id::
     haskey(fmts, String(topic_name)) || error("No FORMAT definition found for topic=$(topic_name)")
     fmt = fmts[String(topic_name)]
 
-    N = count_data_samples(path, msg_id)
+    N = _count_data_samples(path, msg_id)
     cols, ts = init_columns_prealloc(fmt, fmts, N)
 
     expected_omitted = expected_struct_bytes(fmt, fmts)
