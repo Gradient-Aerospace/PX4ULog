@@ -7,7 +7,8 @@ parameters, and logged strings for post-flight analysis and debugging.
 ## Requirements
 
 PX4ULog requires Julia 1.12 or later. The core package depends only on Julia standard
-libraries. DataFrames.jl support is provided through an optional package extension.
+libraries. DataFrames.jl and SystemsOfSystems.jl support is provided through optional
+package extensions.
 
 ## Installation
 
@@ -57,11 +58,12 @@ Scalar fields are vectors, fixed-size arrays are `N x array_length` matrices, ch
 arrays are strings, and nested field names are flattened with underscores. Multi-instance
 topics are selected with `multi_id`.
 
-For repeated extraction, scan data offsets once:
+The first topic read builds a data index. Later reads from the same `ULog` reuse it
+automatically:
 
 ```julia
-index = PX4ULog.build_data_index(ulog)
-attitude = PX4ULog.read_topic(ulog, "vehicle_attitude", 0, index)
+attitude = PX4ULog.read_topic(ulog, "vehicle_attitude", 0)
+position = PX4ULog.read_topic(ulog, "vehicle_local_position", 0)
 ```
 
 ## Time
@@ -81,6 +83,50 @@ t_s = PX4ULog.time_seconds(attitude, ulog)
 ```
 
 Empty topics produce empty timestamp, column, and time vectors.
+
+## TimeSeries
+
+After loading SystemsOfSystems.jl, a complete topic can be converted to a discrete
+`TimeSeries`. Each sample is a concrete `NamedTuple`, and fixed-size array fields are
+represented by `SVector`s.
+
+```julia
+using SystemsOfSystems
+
+position_messages_ts = PX4ULog.to_timeseries(
+    ulog,
+    "vehicle_local_position",
+    0,
+)
+
+vx_ts = select(
+    message -> message.vx,
+    position_messages_ts;
+    title = "North Velocity",
+    dimensions = ["North velocity" => "m/s"],
+)
+```
+
+The ULog start timestamp provides a common time origin, preserving the actual timing
+between topics. Previously decoded data can be converted with the same origin:
+
+```julia
+position = PX4ULog.read_topic(ulog, "vehicle_local_position", 0)
+position_messages_ts = PX4ULog.to_timeseries(position, ulog)
+```
+
+When no `ULog` is available, the origin must be explicit:
+
+```julia
+position_messages_ts = PX4ULog.to_timeseries(
+    position;
+    t0_us = UInt64(1_000_000),
+)
+```
+
+ULog records describe fixed array lengths but not higher-level meaning. PX4ULog therefore
+does not infer that an array represents a quaternion, matrix, or physical vector. Analyses
+can make those domain-specific conversions explicitly.
 
 ## Metadata And Parameters
 
@@ -133,10 +179,9 @@ topic or information data rather than expanded into high-level event objects.
 
 ## Performance
 
-Topic decoding uses a count pass followed by preallocation and a decode pass. Numeric
-scalar and array fields are written directly into their destination columns. Character
-array fields allocate one `String` per decoded sample. `build_data_index` avoids repeated
-full-file scans when several topics will be extracted from the same log.
+The first topic read indexes the log and later reads reuse those data offsets. Numeric
+scalar and array fields are written directly into preallocated destination columns.
+Character array fields allocate one `String` per decoded sample.
 
 ## Testing
 

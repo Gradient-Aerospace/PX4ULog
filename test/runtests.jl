@@ -1,6 +1,8 @@
 using Test
 using PX4ULog
 using DataFrames
+using StaticArrays: SVector
+using SystemsOfSystems: SampleAndHold, select
 
 const ULOG_MAGIC_BYTES = UInt8[0x55, 0x4c, 0x6f, 0x67, 0x01, 0x12, 0x35]
 
@@ -55,6 +57,7 @@ function fixed_string_bytes(value::AbstractString, len::Int)
 end
 
 function typed_value_payload(ulog_type::AbstractString, value)
+
     match_result = match(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)\])?$", ulog_type)
     match_result === nothing && error("Invalid test ULog type: $ulog_type")
     base_type = String(match_result.captures[1])
@@ -75,6 +78,7 @@ function typed_value_payload(ulog_type::AbstractString, value)
     bytes = UInt8[]
     push_le!(bytes, value)
     return bytes
+
 end
 
 function typed_key_value_payload_raw(
@@ -210,6 +214,7 @@ function data_payload(msg_id::UInt16, values...)
 end
 
 function nested_data_payload()
+
     bytes = UInt8[]
     push_le!(bytes, UInt16(0))
     push_le!(bytes, UInt64(2_000_000))
@@ -225,9 +230,11 @@ function nested_data_payload()
     push!(bytes, 0x24)
     push!(bytes, 0xdd)
     return bytes
+
 end
 
 function nested_records(; include_metadata::Bool = false)
+
     records = Tuple{Char, Vector{UInt8}}[]
     if include_metadata
         push!(records, ('I', typed_key_value_payload(
@@ -283,6 +290,7 @@ function nested_records(; include_metadata::Bool = false)
     push!(records, ('R', UInt8[0x00, 0x00]))
     push!(records, ('X', UInt8[0xde, 0xad]))
     return records
+
 end
 
 function error_text(f)
@@ -301,8 +309,12 @@ end
 
         @test ulog.header.magic_ok
         @test PX4ULog.topics(ulog) == [("outer", UInt8(0))]
+        @test isnothing(ulog.cache.data_index)
 
+        # The first topic read builds the index owned by this ULog.
         td = PX4ULog.read_topic(ulog, "outer", 0)
+        cached_index = ulog.cache.data_index
+        @test !isnothing(cached_index)
         @test td.timestamp == UInt64[2_000_000]
         @test sort(collect(keys(td.cols)); by = String) == [:inner_a, :inner_b]
         @test td.inner_a == reshape(UInt16[0x1234, 0x5678], 1, 2)
@@ -310,10 +322,18 @@ end
         @test PX4ULog.time_seconds(td) == [0.0]
         @test PX4ULog.time_seconds(td, ulog) == [1.0]
 
-        index = PX4ULog.build_data_index(ulog)
-        indexed = PX4ULog.read_topic(ulog, "outer", 0, index)
+        # The path overload performs its own count pass before decoding. Compare it with
+        # the cached ULog reader so this internal preallocation path remains covered.
+        path_topic = PX4ULog.read_topic(path, "outer", 0)
+        @test path_topic.timestamp == td.timestamp
+        @test path_topic.cols == td.cols
+
+        # Explicit low-level indexing remains equivalent to the cached reader.
+        explicit_index = PX4ULog.build_data_index(ulog)
+        indexed = PX4ULog.read_topic(ulog, "outer", 0, explicit_index)
         @test indexed.inner_a == td.inner_a
         @test indexed.inner_b == td.inner_b
+        @test ulog.cache.data_index === cached_index
 
         df = PX4ULog.to_dataframe(td; time_s = true)
         @test names(df) == [
@@ -322,6 +342,68 @@ end
         @test df.t == [0.0]
         @test df.inner_a_1 == UInt16[0x1234]
         @test df.inner_b_2 == UInt8[0x24]
+
+        # A complete topic becomes a typed stream of messages on the ULog time axis.
+        ts = PX4ULog.to_timeseries(td, ulog)
+        @test ts.time == [1.0]
+        @test ts.title == "outer"
+        @test ts.path == "/px4/outer/0"
+        @test ts.time_dimension.label == "Time"
+        @test ts.time_dimension.units == "s"
+        @test isempty(ts.dimensions)
+        @test isempty(ts.groups)
+        @test ts.discrete
+        @test ts.interpolator isa SampleAndHold
+        @test eltype(ts.data) == NamedTuple{
+            (:timestamp, :inner_a, :inner_b),
+            Tuple{UInt64,SVector{2,UInt16},SVector{2,UInt8}},
+        }
+        @test ts.data == [(
+            timestamp = UInt64(2_000_000),
+            inner_a = SVector{2,UInt16}(0x1234, 0x5678),
+            inner_b = SVector{2,UInt8}(0x42, 0x24),
+        )]
+        @test td.inner_a == reshape(UInt16[0x1234, 0x5678], 1, 2)
+        @test td.inner_b == reshape(UInt8[0x42, 0x24], 1, 2)
+
+        # Direct reading reuses the cached index and the common ULog time origin.
+        direct_ts = PX4ULog.to_timeseries(ulog, "outer", 0)
+        @test direct_ts.time == ts.time
+        @test direct_ts.data == ts.data
+        @test ulog.cache.data_index === cached_index
+
+        explicit_origin_ts = PX4ULog.to_timeseries(
+            td;
+            t0_us = UInt64(1_500_000),
+            title = "Nested values",
+            path = "/nested",
+        )
+        @test explicit_origin_ts.time == [0.5]
+        @test explicit_origin_ts.title == "Nested values"
+        @test explicit_origin_ts.path == "/nested"
+
+        # Fixed-array fields can be selected as ordinary, dimensioned signals.
+        inner_a_ts = select(
+            message -> message.inner_a,
+            ts;
+            dimensions = ["First value" => "", "Second value" => ""],
+        )
+        @test inner_a_ts.data == SVector{2,UInt16}[SVector(0x1234, 0x5678)]
+
+        # Cache ownership and first-read initialization are local to each ULog object.
+        other_ulog = PX4ULog.ULog(path)
+        @test isnothing(other_ulog.cache.data_index)
+        @test PX4ULog.cached_data_index(other_ulog) !== cached_index
+
+        # Concurrent first reads all receive the one index installed in the cache.
+        concurrent_ulog = PX4ULog.ULog(path)
+        tasks = [
+            Threads.@spawn(PX4ULog.cached_data_index(concurrent_ulog))
+            for _ in 1:4
+        ]
+        concurrent_indexes = fetch.(tasks)
+        @test all(index -> index === concurrent_indexes[1], concurrent_indexes)
+        @test concurrent_ulog.cache.data_index === concurrent_indexes[1]
     end
 end
 
@@ -400,6 +482,28 @@ end
         @test PX4ULog.read_topic(multi_ulog, "sample", 0).value == Float32[1.0]
         @test PX4ULog.read_topic(multi_ulog, "sample", 1).value == Float32[2.0]
 
+        # Both instances retain their actual offset from the common ULog start.
+        first_ts = PX4ULog.to_timeseries(multi_ulog, "sample", 0)
+        second_ts = PX4ULog.to_timeseries(multi_ulog, "sample", 1)
+        @test first_ts.time == [1.0]
+        @test second_ts.time ≈ [1.1]
+
+        value_ts = select(
+            message -> message.value,
+            first_ts;
+            dimensions = ["Value" => "m"],
+        )
+        @test value_ts.data == Float32[1.0]
+
+        held_topic = PX4ULog.TopicData(
+            "held_sample",
+            UInt8(0),
+            UInt64[1_000_000, 2_000_000],
+            Dict{Symbol,Any}(:value => Float32[1.0, 2.0]),
+        )
+        held_ts = PX4ULog.to_timeseries(held_topic; t0_us = UInt64(1_000_000))
+        @test held_ts(0.5).value == 1.0f0
+
         empty_records = [
             ('F', format),
             ('A', add_subscription_payload(0x00, UInt16(12), "sample")),
@@ -425,6 +529,52 @@ end
         @test names(empty_df) == ["timestamp", "t", "value"]
         @test nrow(empty_df) == 0
         @test empty_df.t == Float64[]
+
+        # Empty topics retain the concrete message type derived from their columns.
+        empty_ts = PX4ULog.to_timeseries(empty_topic, empty_ulog)
+        @test isempty(empty_ts.time)
+        @test isempty(empty_ts.data)
+        @test eltype(empty_ts.data) == NamedTuple{
+            (:timestamp, :value),
+            Tuple{UInt64,Float32},
+        }
+
+        empty_array_topic = PX4ULog.TopicData(
+            "empty_array",
+            UInt8(0),
+            UInt64[],
+            Dict{Symbol,Any}(:q => Matrix{Float32}(undef, 0, 4)),
+        )
+        empty_array_ts = PX4ULog.to_timeseries(
+            empty_array_topic;
+            t0_us = UInt64(0),
+        )
+        @test eltype(empty_array_ts.data) == NamedTuple{
+            (:timestamp, :q),
+            Tuple{UInt64,SVector{4,Float32}},
+        }
+
+        missing_timestamp = PX4ULog.TopicData(
+            "missing_timestamp",
+            UInt8(0),
+            nothing,
+            Dict{Symbol,Any}(:value => Float32[1.0]),
+        )
+        @test_throws ErrorException PX4ULog.to_timeseries(
+            missing_timestamp;
+            t0_us = UInt64(0),
+        )
+
+        unsupported_storage = PX4ULog.TopicData(
+            "unsupported_storage",
+            UInt8(0),
+            UInt64[0],
+            Dict{Symbol,Any}(:value => 1.0f0),
+        )
+        @test_throws ErrorException PX4ULog.to_timeseries(
+            unsupported_storage;
+            t0_us = UInt64(0),
+        )
     end
 end
 

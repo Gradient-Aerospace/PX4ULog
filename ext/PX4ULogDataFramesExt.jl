@@ -25,6 +25,7 @@ function PX4ULog.to_dataframe(
     drop_cols::Function = (sym::Symbol)->false,
     copycols::Bool = false,
 )
+
     df = DataFrame()
 
     # Determine row count N
@@ -33,6 +34,7 @@ function PX4ULog.to_dataframe(
     else
         isempty(td.cols) && return df
         length(first(values(td.cols)))
+
     end
 
     # Timestamp / time

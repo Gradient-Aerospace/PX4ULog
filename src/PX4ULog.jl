@@ -9,7 +9,7 @@ module PX4ULog
 export ULogHeader, ULogMessage, read_ulog_header, each_message, scan_messages
 export FieldDef, FormatDef, scan_formats, read_all_formats, parse_format_string
 export Subscription, scan_subscriptions, read_all_subscriptions
-export TopicData, read_topic, count_data_samples
+export TopicData, read_topic
 export ULog, topics, build_data_index
 export ULogMetadata, ParameterChange, LoggedMessage
 export info_messages, info_message, info_types, info_multiple
@@ -17,7 +17,7 @@ export initial_parameters, changed_parameters, default_parameters, has_default_p
 export logged_messages
 export time_seconds
 export audit_data_lengths
-export to_dataframe
+export to_dataframe, to_timeseries
 
 using Printf
 
@@ -36,6 +36,18 @@ Set `time_s = true` to add time in seconds and use `expand_arrays` to select
 `:columns`, `:rowviews`, or `:vectors` for fixed-size array fields.
 """
 function to_dataframe end
+
+"""
+    to_timeseries(td::TopicData, ulog::ULog; kwargs...)
+    to_timeseries(td::TopicData; t0_us, kwargs...)
+    to_timeseries(ulog::ULog, topic_name, multi_id = 0; kwargs...)
+
+Convert decoded topic data to a discrete `TimeSeries` of `NamedTuple` messages. Methods
+are provided by the optional SystemsOfSystems extension after SystemsOfSystems.jl is
+loaded. Message timestamps are expressed in seconds relative to the ULog start or the
+explicit `t0_us` origin.
+"""
+function to_timeseries end
 
 # -----------------------------------------------------------------------------
 # Types
@@ -232,6 +244,7 @@ end
 Read the fixed 16-byte ULog header.
 """
 function read_ulog_header(io::IO)::ULogHeader
+
     raw_vec = Vector{UInt8}(undef, 16)
     read!(io, raw_vec)
 
@@ -246,6 +259,7 @@ function read_ulog_header(io::IO)::ULogHeader
     end
 
     return ULogHeader(magic_ok, version, ts, raw)
+
 end
 
 function validate_ulog_header(hdr::ULogHeader)
@@ -254,6 +268,7 @@ function validate_ulog_header(hdr::ULogHeader)
 end
 
 function decode_flag_bits(msg::ULogMessage)::FlagBits
+
     msg.type == UInt8('B') || error("decode_flag_bits: expected 'B', got $(Char(msg.type))")
     length(msg.payload) == 40 || error(
         "FLAG_BITS payload has $(length(msg.payload)) bytes, expected 40",
@@ -265,6 +280,7 @@ function decode_flag_bits(msg::ULogMessage)::FlagBits
     appended_offsets = ntuple(i -> read_u64_le(p, 17 + 8*(i-1)), 3)
 
     return FlagBits(compat_flags, incompat_flags, appended_offsets)
+
 end
 
 function validate_flag_bits(flags::FlagBits)
@@ -280,6 +296,7 @@ function validate_flag_bits(flags::FlagBits)
 end
 
 function read_ulog_preamble!(io::IO)::Tuple{ULogHeader, FlagBits}
+
     hdr = read_ulog_header(io)
     validate_ulog_header(hdr)
 
@@ -291,6 +308,7 @@ function read_ulog_preamble!(io::IO)::Tuple{ULogHeader, FlagBits}
     validate_flag_bits(flags)
 
     return hdr, flags
+
 end
 
 # -----------------------------------------------------------------------------
@@ -298,6 +316,7 @@ end
 # -----------------------------------------------------------------------------
 
 function read_message_or_nothing!(io::IO)::Union{ULogMessage, Nothing}
+
     eof(io) && return nothing
     offset = position(io)
 
@@ -309,6 +328,7 @@ function read_message_or_nothing!(io::IO)::Union{ULogMessage, Nothing}
         else
             rethrow()
         end
+
     end
     b2 = try
         read(io, UInt8)
@@ -381,6 +401,7 @@ function scan_messages(
     max_messages::Int = 2000,
     show_types::Bool = true,
 )
+
     open(path, "r") do io
         hdr, _ = read_ulog_preamble!(io)
         println("ULog header:")
@@ -424,6 +445,7 @@ function scan_messages(
 
         return counts
     end
+
 end
 
 # -----------------------------------------------------------------------------
@@ -436,6 +458,7 @@ function decode_format(msg::ULogMessage)::String
 end
 
 function parse_field_token(tok::AbstractString)::FieldDef
+
     s = strip(tok)
     isempty(s) && error("Empty field token in FORMAT")
 
@@ -461,6 +484,7 @@ function parse_field_token(tok::AbstractString)::FieldDef
     array_len = max(type_arr, name_arr)
 
     return FieldDef(Symbol(field_name), base_type, array_len)
+
 end
 
 """
@@ -470,6 +494,7 @@ Parse the payload text of one ULog `FORMAT` record. Invalid field syntax throws 
 `ErrorException`; nested type references are validated when all formats are loaded.
 """
 function parse_format_string(fmt::AbstractString)::FormatDef
+
     s = strip(fmt)
     isempty(s) && error("Empty FORMAT string")
 
@@ -490,6 +515,7 @@ function parse_format_string(fmt::AbstractString)::FormatDef
     end
 
     return FormatDef(String(name), fields)
+
 end
 
 """
@@ -499,6 +525,7 @@ Read and validate every ULog format definition. Forward references are accepted;
 unknown nested formats and cyclic definitions throw an `ErrorException`.
 """
 function read_all_formats(path::AbstractString)
+
     open(path, "r") do io
         _ = read_ulog_preamble!(io)
         formats = Dict{String, FormatDef}()
@@ -514,6 +541,7 @@ function read_all_formats(path::AbstractString)
         validate_format_graph(formats)
         return formats
     end
+
 end
 
 """
@@ -522,6 +550,7 @@ end
 Print up to `max_formats` raw ULog format definitions and return the number printed.
 """
 function scan_formats(path::AbstractString; max_formats::Int = 20)
+
     open(path, "r") do io
         _ = read_ulog_preamble!(io)
 
@@ -537,6 +566,7 @@ function scan_formats(path::AbstractString; max_formats::Int = 20)
         end
         return n
     end
+
 end
 
 # -----------------------------------------------------------------------------
@@ -555,6 +585,7 @@ end
 end
 
 function decode_add_logged_msg(msg::ULogMessage)::Subscription
+
     msg.type == UInt8('A') || error("decode_add_logged_msg: expected 'A', got $(Char(msg.type))")
 
     p = msg.payload
@@ -567,6 +598,7 @@ function decode_add_logged_msg(msg::ULogMessage)::Subscription
     isempty(name) && error("ADD_LOGGED_MSG has empty message_name (msg_id=$msg_id)")
 
     return Subscription(msg_id, multi_id, name)
+
 end
 
 """
@@ -576,6 +608,7 @@ Read all topic subscriptions. Return dictionaries indexed by message identifier 
 `(topic_name, multi_id)`. Later records replace earlier records with the same key.
 """
 function read_all_subscriptions(path::AbstractString)
+
     open(path, "r") do io
         _ = read_ulog_preamble!(io)
 
@@ -592,6 +625,7 @@ function read_all_subscriptions(path::AbstractString)
 
         return subs_by_id, subs_by_name
     end
+
 end
 
 """
@@ -660,10 +694,12 @@ function format_lookup(formats::Dict{String, FormatDef}, name::AbstractString)::
 end
 
 function validate_format_graph(formats::Dict{String, FormatDef})
+
     states = Dict{String, UInt8}()
     stack = String[]
 
     function visit(name::String)
+
         state = get(states, name, 0x00)
         if state == 0x01
             cycle_start = findfirst(==(name), stack)
@@ -685,12 +721,14 @@ function validate_format_graph(formats::Dict{String, FormatDef})
         pop!(stack)
         states[name] = 0x02
         return nothing
+
     end
 
     for name in keys(formats)
         visit(name)
     end
     return nothing
+
 end
 
 function prefixed_name(prefix::AbstractString, name::Symbol)::Symbol
@@ -715,6 +753,7 @@ function format_serialized_bytes(
     omit_final_padding::Bool,
     stack::Vector{String}=String[],
 )::Int
+
     if fmt.name in stack
         cycle = join([stack; fmt.name], " -> ")
         error("Circular ULog FORMAT definition: $cycle")
@@ -744,6 +783,7 @@ function format_serialized_bytes(
     end
     pop!(stack)
     return total
+
 end
 
 function expected_struct_bytes(fmt::FormatDef, formats::Dict{String, FormatDef})::Int
@@ -765,6 +805,7 @@ function final_padding_omitted(
     topic_name::AbstractString,
     payload_len::Int,
 )::Bool
+
     if struct_len == expected_omitted
         return true
     elseif struct_len == expected_full
@@ -783,6 +824,7 @@ function final_padding_omitted(
             "final padding. DATA payload len=$(payload_len)",
         )
     end
+
 end
 
 function init_columns_for_format!(
@@ -794,6 +836,7 @@ function init_columns_for_format!(
     repetitions::Int=1,
     top_level::Bool=false,
 )::Bool
+
     has_ts = false
 
     for f in fmt.fields
@@ -840,6 +883,7 @@ function init_columns_for_format!(
     end
 
     return has_ts
+
 end
 
 function init_columns_prealloc(fmt::FormatDef, formats::Dict{String, FormatDef}, N::Int)
@@ -865,6 +909,7 @@ function decode_primitive_field!(
     repetitions::Int,
     top_level::Bool,
 )::Int
+
     (T, sz) = ulog_primitive(f.ulog_type)
     is_top_timestamp = top_level &&
                        isempty(prefix) &&
@@ -908,8 +953,10 @@ function decode_primitive_field!(
     @inbounds for j in 1:n
         M[k, base_col + j] = load_le(T, payload, i)
         i += sz
+
     end
     return i
+
 end
 
 function decode_format_into_columns_at!(
@@ -926,6 +973,7 @@ function decode_format_into_columns_at!(
     top_level::Bool=false,
     omit_final_padding::Bool=false,
 )::Int
+
     for (idx, f) in enumerate(fmt.fields)
         if is_padding(f)
             if !(top_level && omit_final_padding && idx == lastindex(fmt.fields))
@@ -975,6 +1023,7 @@ function decode_format_into_columns_at!(
     end
 
     return i
+
 end
 
 function decode_data_into_columns_at!(
@@ -1127,6 +1176,7 @@ function decode_typed_value(ulog_type::AbstractString, payload::Vector{UInt8}, i
 end
 
 function decode_typed_key_value(payload::Vector{UInt8}, start::Int=1)::TypedKeyValue
+
     start <= length(payload) || error("Typed key/value payload is empty")
     key_len = Int(payload[start])
     key_start = start + 1
@@ -1141,6 +1191,7 @@ function decode_typed_key_value(payload::Vector{UInt8}, start::Int=1)::TypedKeyV
     key = String(parts[2])
     value = decode_typed_value(ulog_type, payload, value_start)
     return TypedKeyValue(key, ulog_type, value)
+
 end
 
 function decode_info_multiple(msg::ULogMessage)::Tuple{Bool, TypedKeyValue}
@@ -1229,6 +1280,7 @@ function data_timestamp_or_nothing(
     formats::Dict{String, FormatDef},
     subs_by_id::Dict{UInt16, Subscription},
 )::Union{UInt64, Nothing}
+
     msg.type == UInt8('D') || return nothing
     id = data_msg_id(msg)
     sub = get(subs_by_id, id, nothing)
@@ -1254,6 +1306,7 @@ function data_timestamp_or_nothing(
         i > length(msg.payload) && return nothing
     end
     return nothing
+
 end
 
 function read_all_metadata(
@@ -1261,6 +1314,7 @@ function read_all_metadata(
     formats::Dict{String, FormatDef},
     subs_by_id::Dict{UInt16, Subscription},
 )::ULogMetadata
+
     open(path, "r") do io
         hdr, flags = read_ulog_preamble!(io)
         metadata = ULogMetadata(; has_default_parameters=(flags.compat_flags[1] & 0x01) != 0)
@@ -1310,6 +1364,7 @@ function read_all_metadata(
         end
         return metadata
     end
+
 end
 
 # -----------------------------------------------------------------------------
@@ -1323,13 +1378,8 @@ end
     return UInt16(p[1]) | (UInt16(p[2]) << 8)
 end
 
-"""
-    count_data_samples(path_or_ulog, msg_id) -> Int
-
-Count complete `DATA` records for one message identifier. This scans the log once and
-does not decode the samples.
-"""
-function count_data_samples(path::AbstractString, msg_id::UInt16)
+# Count complete DATA records to preallocate storage for the path-based topic reader.
+function _count_data_samples(path::AbstractString, msg_id::UInt16)
     n = 0
     open(path, "r") do io
         _ = read_ulog_preamble!(io)
@@ -1343,15 +1393,18 @@ function count_data_samples(path::AbstractString, msg_id::UInt16)
 end
 
 """
-    read_topic(path_or_ulog, topic_name, multi_id = 0) -> TopicData
+    read_topic(path, topic_name, multi_id = 0) -> TopicData
+    read_topic(ulog, topic_name, multi_id = 0) -> TopicData
     read_topic(ulog, topic_name, multi_id, index) -> TopicData
 
 Decode all samples for one topic instance into preallocated, column-oriented storage.
-The non-indexed overload performs a count pass followed by a decode pass. The indexed
-overload uses offsets from [`build_data_index`](@ref). Missing subscriptions, malformed
-formats, and invalid data payload lengths throw an `ErrorException`.
+The path overload performs a count pass followed by a decode pass. A `ULog` lazily builds
+and reuses a data index, while the explicit indexed overload uses the supplied offsets.
+Missing subscriptions, malformed formats, and invalid data payload lengths throw an
+`ErrorException`.
 """
 function read_topic(path::AbstractString, topic_name::AbstractString, multi_id::Integer=0)
+
     fmts = read_all_formats(path)
     _, subs_by_name = read_all_subscriptions(path)
 
@@ -1364,7 +1417,7 @@ function read_topic(path::AbstractString, topic_name::AbstractString, multi_id::
     haskey(fmts, String(topic_name)) || error("No FORMAT definition found for topic=$(topic_name)")
     fmt = fmts[String(topic_name)]
 
-    N = count_data_samples(path, msg_id)
+    N = _count_data_samples(path, msg_id)
     cols, ts = init_columns_prealloc(fmt, fmts, N)
 
     expected_omitted = expected_struct_bytes(fmt, fmts)
@@ -1400,6 +1453,7 @@ function read_topic(path::AbstractString, topic_name::AbstractString, multi_id::
     k == N || error("Internal: counted N=$N samples but decoded k=$k")
 
     return TopicData(String(topic_name), UInt8(multi_id), ts, cols)
+
 end
 
 """
@@ -1415,6 +1469,7 @@ function audit_data_lengths(
     multi_id::Integer = 0;
     max_hits::Int = 200,
 )
+
     fmts = read_all_formats(path)
     _, subs_by_name = read_all_subscriptions(path)
 
@@ -1456,19 +1511,31 @@ function audit_data_lengths(
     end
 
     return (expected_omitted, expected_full), lengths
+
 end
 
 # -----------------------------------------------------------------------------
 # ULog object API
 # -----------------------------------------------------------------------------
 
+const DataIndex = Dict{UInt16, Vector{Int64}}
+
+mutable struct ULogCache
+    data_index::Union{Nothing, DataIndex}
+    lock::ReentrantLock
+end
+
+ULogCache() = ULogCache(nothing, ReentrantLock())
+
 """
     ULog(path)
 
-Open a standard ULog file and eagerly read its header, validated format graph, topic
-subscriptions, and metadata. Topic `DATA` records remain on disk until [`read_topic`](@ref)
-is called. Invalid headers, unsupported incompatibility flags, malformed formats, and
-malformed metadata throw an `ErrorException`.
+Open a complete, unchanged ULog file and eagerly read its header, validated format graph,
+topic subscriptions, and metadata. Topic `DATA` records remain on disk until
+[`read_topic`](@ref) is called. The first topic read builds a data index that subsequent
+reads reuse. Modifying the file after constructing `ULog` invalidates its parsed metadata
+and cached data offsets. Invalid headers, unsupported incompatibility flags, malformed
+formats, and malformed metadata throw an `ErrorException`.
 """
 struct ULog
     path::String
@@ -1477,6 +1544,7 @@ struct ULog
     subs_by_id::Dict{UInt16, Subscription}
     subs_by_name::Dict{Tuple{String,UInt8}, UInt16}
     metadata::ULogMetadata
+    cache::ULogCache
 end
 
 function ULog(path::AbstractString)
@@ -1488,7 +1556,7 @@ function ULog(path::AbstractString)
     fmts = read_all_formats(p)
     subs_by_id, subs_by_name = read_all_subscriptions(p)
     metadata = read_all_metadata(p, fmts, subs_by_id)
-    return ULog(p, hdr, fmts, subs_by_id, subs_by_name, metadata)
+    return ULog(p, hdr, fmts, subs_by_id, subs_by_name, metadata, ULogCache())
 end
 
 """
@@ -1592,66 +1660,8 @@ function topics(ulog::ULog)
     return ks
 end
 
-function count_data_samples(ulog::ULog, msg_id::UInt16)
-    n = 0
-    open(ulog.path, "r") do io
-        _ = read_ulog_preamble!(io)
-        for msg in each_message(io)
-            if msg.type == UInt8('D') && data_msg_id(msg) == msg_id
-                n += 1
-            end
-        end
-    end
-    return n
-end
-
 function read_topic(ulog::ULog, topic_name::AbstractString, multi_id::Integer=0)
-    key = (String(topic_name), UInt8(multi_id))
-    haskey(ulog.subs_by_name, key) || error(
-        "No subscription for topic=$(topic_name) multi_id=$(multi_id)",
-    )
-    msg_id = ulog.subs_by_name[key]
-
-    haskey(ulog.formats, String(topic_name)) || error(
-        "No FORMAT definition found for topic=$(topic_name)",
-    )
-    fmt = ulog.formats[String(topic_name)]
-
-    N = count_data_samples(ulog, msg_id)
-    cols, ts = init_columns_prealloc(fmt, ulog.formats, N)
-
-    expected_omitted = expected_struct_bytes(fmt, ulog.formats)
-    expected_full = full_struct_bytes(fmt, ulog.formats)
-
-    k = 0
-    open(ulog.path, "r") do io
-        _ = read_ulog_preamble!(io)
-        for msg in each_message(io)
-            if msg.type == UInt8('D') && data_msg_id(msg) == msg_id
-                k += 1
-                p = msg.payload
-                omit_final_padding = final_padding_omitted(
-                    length(p) - 2,
-                    expected_omitted,
-                    expected_full,
-                    topic_name,
-                    length(p),
-                )
-                decode_data_into_columns_at!(
-                    fmt,
-                    ulog.formats,
-                    p,
-                    k,
-                    ts,
-                    cols;
-                    omit_final_padding=omit_final_padding,
-                )
-            end
-        end
-    end
-
-    k == N || error("Internal: counted N=$N samples but decoded k=$k")
-    return TopicData(String(topic_name), UInt8(multi_id), ts, cols)
+    return read_topic(ulog, topic_name, multi_id, cached_data_index(ulog))
 end
 
 """
@@ -1661,7 +1671,7 @@ Scan a log once and return zero-based file offsets for every `DATA` message iden
 Use the result with indexed [`read_topic`](@ref) calls to avoid repeated full scans.
 """
 function build_data_index(ulog::ULog)
-    index = Dict{UInt16, Vector{Int64}}()
+    index = DataIndex()
     open(ulog.path, "r") do io
         _ = read_ulog_preamble!(io)
         for msg in each_message(io)
@@ -1675,12 +1685,28 @@ function build_data_index(ulog::ULog)
     return index
 end
 
+function cached_data_index(ulog::ULog)
+
+    return lock(ulog.cache.lock) do
+
+        index = ulog.cache.data_index
+        if isnothing(index)
+            index = build_data_index(ulog)
+            ulog.cache.data_index = index
+        end
+        return index
+
+    end
+
+end
+
 function read_topic(
     ulog::ULog,
     topic_name::AbstractString,
     multi_id::Integer,
     index::Dict{UInt16, Vector{Int64}},
 )
+
     key = (String(topic_name), UInt8(multi_id))
     haskey(ulog.subs_by_name, key) || error(
         "No subscription for topic=$(topic_name) multi_id=$(multi_id)",
@@ -1731,6 +1757,7 @@ function read_topic(
     end
 
     return TopicData(String(topic_name), UInt8(multi_id), ts, cols)
+
 end
 
 # -----------------------------------------------------------------------------

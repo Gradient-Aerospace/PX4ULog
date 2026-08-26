@@ -1,4 +1,9 @@
 [deps]
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 PX4ULog = "f9a4f512-fe73-430d-b50d-a67499c1e6e0"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+SystemsOfSystems = "444f41de-88f0-45df-a3dd-0849e84f1dfe"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+SystemsOfSystems = {rev = "0bb3893d7c5c907d01467c9bf32235457f941854", url = "https://github.com/Gradient-Aerospace/SystemsOfSystems.jl.git"}
