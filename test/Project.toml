@@ -6,4 +6,4 @@ SystemsOfSystems = "444f41de-88f0-45df-a3dd-0849e84f1dfe"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
-SystemsOfSystems = {rev = "da45b073dbd6c0e13f930ff2a031b8b556c90d7f", url = "https://github.com/Gradient-Aerospace/SystemsOfSystems.jl.git"}
+SystemsOfSystems = {rev = "0bb3893d7c5c907d01467c9bf32235457f941854", url = "https://github.com/Gradient-Aerospace/SystemsOfSystems.jl.git"}
