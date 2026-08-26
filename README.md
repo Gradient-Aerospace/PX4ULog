@@ -100,8 +100,8 @@ position_messages_ts = PX4ULog.to_timeseries(
 )
 
 vx_ts = select(
-    position_messages_ts,
-    :vx;
+    message -> message.vx,
+    position_messages_ts;
     title = "North Velocity",
     dimensions = ["North velocity" => "m/s"],
 )

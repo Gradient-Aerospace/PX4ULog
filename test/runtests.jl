@@ -384,8 +384,8 @@ end
 
         # Fixed-array fields can be selected as ordinary, dimensioned signals.
         inner_a_ts = select(
-            ts,
-            :inner_a;
+            message -> message.inner_a,
+            ts;
             dimensions = ["First value" => "", "Second value" => ""],
         )
         @test inner_a_ts.data == SVector{2,UInt16}[SVector(0x1234, 0x5678)]
@@ -489,8 +489,8 @@ end
         @test second_ts.time ≈ [1.1]
 
         value_ts = select(
-            first_ts,
-            :value;
+            message -> message.value,
+            first_ts;
             dimensions = ["Value" => "m"],
         )
         @test value_ts.data == Float32[1.0]
