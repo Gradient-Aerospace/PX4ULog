@@ -897,179 +897,146 @@ function init_columns_prealloc(fmt::FormatDef, N::Int)
     return init_columns_prealloc(fmt, Dict{String, FormatDef}(), N)
 end
 
-function decode_primitive_field!(
-    f::FieldDef,
-    payload::Vector{UInt8},
-    i::Int,
-    k::Int,
-    timestamp::Union{Vector{UInt64}, Nothing},
-    cols::Dict{Symbol, Any};
-    prefix::String,
-    repetition_index::Int,
-    repetitions::Int,
-    top_level::Bool,
-)::Int
+# Operations specialize only on element type and column rank, not on topic schemas.
+# Each plan owns references to the columns allocated for one read and is then discarded.
+abstract type ColumnDecode end
 
-    (T, sz) = ulog_primitive(f.ulog_type)
-    is_top_timestamp = top_level &&
-                       isempty(prefix) &&
-                       f.name == :timestamp &&
-                       f.ulog_type == "uint64_t" &&
-                       f.array_len == 0
-
-    if f.array_len == 0
-        x = load_le(T, payload, i)
-        i += sz
-
-        if is_top_timestamp
-            timestamp === nothing && error("Internal: timestamp column not initialized")
-            timestamp[k] = x::UInt64
-        elseif repetitions == 1
-            cols[prefixed_name(prefix, f.name)][k] = x
-        else
-            cols[prefixed_name(prefix, f.name)][k, repetition_index] = x
-        end
-        return i
-    end
-
-    n = f.array_len
-    name = prefixed_name(prefix, f.name)
-    if T == UInt8 && f.ulog_type == "char"
-        last_nonzero = i + n - 1
-        while last_nonzero >= i && payload[last_nonzero] == 0x00
-            last_nonzero -= 1
-        end
-        str = last_nonzero < i ? "" : String(payload[i:last_nonzero])
-        if repetitions == 1
-            cols[name][k] = str
-        else
-            cols[name][k, repetition_index] = str
-        end
-        return i + n
-    end
-
-    M = cols[name]::Matrix{T}
-    base_col = (repetition_index - 1) * n
-    @inbounds for j in 1:n
-        M[k, base_col + j] = load_le(T, payload, i)
-        i += sz
-
-    end
-    return i
-
+struct FieldDecode{T, N} <: ColumnDecode
+    column::Array{T, N}
+    offset::Int
+    first_column::Int
+    count::Int
 end
 
-function decode_format_into_columns_at!(
+struct DecodePlan
+    fields::Vector{ColumnDecode}
+    row::Base.RefValue{Int}
+    expected_omitted::Int
+    expected_full::Int
+    topic_name::String
+end
+
+function append_decode_fields!(
+    fields::Vector{ColumnDecode},
     fmt::FormatDef,
     formats::Dict{String, FormatDef},
-    payload::Vector{UInt8},
-    i::Int,
-    k::Int,
     timestamp::Union{Vector{UInt64}, Nothing},
     cols::Dict{Symbol, Any};
-    prefix::String="",
-    repetition_index::Int=1,
-    repetitions::Int=1,
-    top_level::Bool=false,
-    omit_final_padding::Bool=false,
-)::Int
+    offset::Int = 3,
+    prefix::String = "",
+    repetition_index::Int = 1,
+    top_level::Bool = false,
+)
 
-    for (idx, f) in enumerate(fmt.fields)
+    # Flatten each nested repetition in wire order. Column positions follow the same
+    # outer-to-inner order as init_columns_for_format!, including nested arrays.
+    for f in fmt.fields
+        n = field_count(f)
         if is_padding(f)
-            if !(top_level && omit_final_padding && idx == lastindex(fmt.fields))
-                (_, sz) = ulog_primitive(f.ulog_type)
-                i += sz * field_count(f)
-            end
+            (_, width) = ulog_primitive(f.ulog_type)
+            offset += width * n
             continue
         end
 
         info = primitive_info(f.ulog_type)
         if info === nothing
             nested = format_lookup(formats, f.ulog_type)
-            n = field_count(f)
-            nested_repetitions = repetitions * n
-            prefix_child = child_prefix(prefix, f.name)
             for r in 1:n
-                child_index = (repetition_index - 1) * n + r
-                i = decode_format_into_columns_at!(
-                    nested,
-                    formats,
-                    payload,
-                    i,
-                    k,
-                    timestamp,
-                    cols;
-                    prefix=prefix_child,
-                    repetition_index=child_index,
-                    repetitions=nested_repetitions,
-                    top_level=false,
-                    omit_final_padding=false,
+                offset = append_decode_fields!(
+                    fields, nested, formats, timestamp, cols;
+                    offset = offset,
+                    prefix = child_prefix(prefix, f.name),
+                    repetition_index = (repetition_index - 1) * n + r,
                 )
             end
-        else
-            i = decode_primitive_field!(
-                f,
-                payload,
-                i,
-                k,
-                timestamp,
-                cols;
-                prefix=prefix,
-                repetition_index=repetition_index,
-                repetitions=repetitions,
-                top_level=top_level,
-            )
+            continue
         end
-    end
 
-    return i
+        # Only a scalar uint64_t timestamp at the root has dedicated storage.
+        (T, width) = info
+        is_top_timestamp = top_level && f.name == :timestamp &&
+                           f.ulog_type == "uint64_t" && f.array_len == 0
+        column = is_top_timestamp ? timestamp : cols[prefixed_name(prefix, f.name)]
+        column === nothing && error("Internal: timestamp column not initialized")
+        is_string = T == UInt8 && f.ulog_type == "char" && f.array_len > 0
+        first_column = is_string ? repetition_index : (repetition_index - 1) * n + 1
+        push!(fields, FieldDecode(column, offset, first_column, n))
+        offset += width * n
+    end
+    return offset
 
 end
 
-function decode_data_into_columns_at!(
+function build_decode_plan(
     fmt::FormatDef,
     formats::Dict{String, FormatDef},
-    payload::Vector{UInt8},
-    k::Int,
-    timestamp::Union{Vector{UInt64}, Nothing},
-    cols::Dict{Symbol, Any};
-    omit_final_padding::Bool,
-)
-    i = decode_format_into_columns_at!(
-        fmt,
-        formats,
-        payload,
-        3,
-        k,
-        timestamp,
-        cols;
-        top_level=true,
-        omit_final_padding=omit_final_padding,
-    )
-    consumed = i - 3
-    expected = length(payload) - 2
-    consumed == expected || error(
-        "Internal: decoded $consumed struct bytes but payload contains $expected bytes",
-    )
-    return nothing
-end
-
-function decode_data_into_columns_at!(
-    fmt::FormatDef,
-    payload::Vector{UInt8},
-    k::Int,
     timestamp::Union{Vector{UInt64}, Nothing},
     cols::Dict{Symbol, Any},
 )
-    return decode_data_into_columns_at!(
-        fmt,
-        Dict{String, FormatDef}(),
-        payload,
-        k,
-        timestamp,
-        cols;
-        omit_final_padding=true,
+
+    # Validate the format sizes before traversing it, including circular references.
+    expected_omitted = expected_struct_bytes(fmt, formats)
+    expected_full = full_struct_bytes(fmt, formats)
+    fields = ColumnDecode[]
+    append_decode_fields!(fields, fmt, formats, timestamp, cols; top_level = true)
+    return DecodePlan(fields, Ref(0), expected_omitted, expected_full, fmt.name)
+
+end
+
+function decode_field!(
+    field::FieldDecode{T}, payload::Vector{UInt8}, row::Base.RefValue{Int},
+) where {T}
+
+    # Linear indices cover both vectors and matrices without dynamic column lookup.
+    # Payload sizes are checked by the plan before entering this typed operation.
+    stride = size(field.column, 1)
+    destination = row[] + (field.first_column - 1) * stride
+    offset = field.offset
+    for j in 1:field.count
+        field.column[destination] = load_le(T, payload, offset)
+        destination += stride
+        offset += sizeof(T)
+    end
+    return nothing
+
+end
+
+function decode_field!(
+    field::FieldDecode{String}, payload::Vector{UInt8}, row::Base.RefValue{Int},
+)
+
+    # Character arrays strip trailing zeros only; embedded zeros remain in the string.
+    last_nonzero = field.offset + field.count - 1
+    while last_nonzero >= field.offset && payload[last_nonzero] == 0x00
+        last_nonzero -= 1
+    end
+    value = last_nonzero < field.offset ? "" : String(payload[field.offset:last_nonzero])
+    destination = row[] + (field.first_column - 1) * size(field.column, 1)
+    field.column[destination] = value
+    return nothing
+
+end
+
+function decode_data_into_columns_at!(plan::DecodePlan, payload::Vector{UInt8}, k::Int)
+
+    # The final root padding is never read, so one plan handles both legal lengths.
+    # Validate before accessing fields, including payloads supplied by indexed readers.
+    final_padding_omitted(
+        length(payload) - 2,
+        plan.expected_omitted,
+        plan.expected_full,
+        plan.topic_name,
+        length(payload),
     )
+
+    # A shared row reference avoids boxing an integer at each abstract-operation call.
+    # Plans are local to one reader and are never shared between concurrent reads.
+    plan.row[] = k
+    for field in plan.fields
+        decode_field!(field, payload, plan.row)
+    end
+    return nothing
+
 end
 
 @inline load_le(::Type{UInt8},  buf::Vector{UInt8}, i::Int) = buf[i]
@@ -1420,8 +1387,7 @@ function read_topic(path::AbstractString, topic_name::AbstractString, multi_id::
     N = _count_data_samples(path, msg_id)
     cols, ts = init_columns_prealloc(fmt, fmts, N)
 
-    expected_omitted = expected_struct_bytes(fmt, fmts)
-    expected_full = full_struct_bytes(fmt, fmts)
+    plan = build_decode_plan(fmt, fmts, ts, cols)
 
     k = 0
     open(path, "r") do io
@@ -1430,22 +1396,7 @@ function read_topic(path::AbstractString, topic_name::AbstractString, multi_id::
             if msg.type == UInt8('D') && data_msg_id(msg) == msg_id
                 k += 1
                 p = msg.payload
-                omit_final_padding = final_padding_omitted(
-                    length(p) - 2,
-                    expected_omitted,
-                    expected_full,
-                    topic_name,
-                    length(p),
-                )
-                decode_data_into_columns_at!(
-                    fmt,
-                    fmts,
-                    p,
-                    k,
-                    ts,
-                    cols;
-                    omit_final_padding=omit_final_padding,
-                )
+                decode_data_into_columns_at!(plan, p, k)
             end
         end
     end
@@ -1722,8 +1673,7 @@ function read_topic(
     N = length(offsets)
     cols, ts = init_columns_prealloc(fmt, ulog.formats, N)
 
-    expected_omitted = expected_struct_bytes(fmt, ulog.formats)
-    expected_full = full_struct_bytes(fmt, ulog.formats)
+    plan = build_decode_plan(fmt, ulog.formats, ts, cols)
 
     open(ulog.path, "r") do io
         for (k, off) in enumerate(offsets)
@@ -1737,22 +1687,7 @@ function read_topic(
             )
 
             p = msg.payload
-            omit_final_padding = final_padding_omitted(
-                length(p) - 2,
-                expected_omitted,
-                expected_full,
-                topic_name,
-                length(p),
-            )
-            decode_data_into_columns_at!(
-                fmt,
-                ulog.formats,
-                p,
-                k,
-                ts,
-                cols;
-                omit_final_padding=omit_final_padding,
-            )
+            decode_data_into_columns_at!(plan, p, k)
         end
     end
 
