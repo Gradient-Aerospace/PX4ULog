@@ -808,3 +808,103 @@ end
 @testset "Public API documentation" begin
     @test isempty(Base.Docs.undocumented_names(PX4ULog; private = false))
 end
+
+# Keep the allocation measurement behind a function barrier and exclude column/plan
+# construction. Increasing the sample count must not restore per-field boxing.
+function decode_repeated!(plan, payload, count)
+    for k in 1:count
+        PX4ULog.decode_data_into_columns_at!(plan, payload, k)
+    end
+    return nothing
+end
+
+@testset "Resolved decoder plans" begin
+
+    mktempdir() do dir
+
+        # Two levels of repeated children exercise flattening order independently of
+        # array rank. Nested timestamps stay ordinary columns; only the root is special.
+        formats = [
+            "root:uint64_t timestamp;branch[2] branches;uint8_t[3] _padding0;",
+            "branch:leaf[2] leaves;uint8_t[1] _padding0;",
+            "leaf:uint64_t timestamp;float[2] values;bool flag;char[4] label;",
+        ]
+        payload = data_payload(UInt16(0), UInt64(2_000_000))
+        labels = [UInt8['a', 0, 'b', 0], zeros(UInt8, 4),
+            UInt8['c', 'd', 'e', 'f'], UInt8['g', 0, 0, 0]]
+        nan_value = reinterpret(Float32, 0x7fc01234)
+        for r in 1:4
+            push_le!(payload, UInt64(r))
+            push_le!(payload, Float32(r))
+            push_le!(payload, r == 1 ? nan_value : -0.0f0)
+            push!(payload, isodd(r) ? 0x02 : 0x00)
+            append!(payload, labels[r])
+            iseven(r) && push!(payload, 0xff)
+        end
+        records = [('F', format_payload(s)) for s in formats]
+        push!(records, ('A', add_subscription_payload(0x00, UInt16(0), "root")))
+        push!(records, ('D', payload))
+        push!(records, ('D', [payload; 0xaa; 0xbb; 0xcc]))
+        path = write_log(joinpath(dir, "resolved.ulg"), records)
+        ulog = PX4ULog.ULog(path)
+        index = PX4ULog.build_data_index(ulog)
+        topic = PX4ULog.read_topic(ulog, "root", 0, index)
+        from_path = PX4ULog.read_topic(path, "root")
+        @test isequal(topic.cols, from_path.cols)
+        @test topic.timestamp == from_path.timestamp == fill(UInt64(2_000_000), 2)
+        @test topic.branches_leaves_timestamp == repeat(UInt64[1 2 3 4], 2, 1)
+        @test topic.branches_leaves_flag == repeat(Bool[true false true false], 2, 1)
+        @test topic.branches_leaves_label == repeat(["a\0b" "" "cdef" "g"], 2, 1)
+        expected = repeat(Float32[1 nan_value 2 -0.0 3 -0.0 4 -0.0], 2, 1)
+        @test isequal(topic.branches_leaves_values, expected)
+        @test reinterpret(UInt32, vec(topic.branches_leaves_values)) ==
+              reinterpret(UInt32, vec(expected))
+
+        # Plans must reflect mutable metadata on each read, even with a cached index.
+        ulog.formats["leaf"] = PX4ULog.parse_format_string(
+            "leaf:uint64_t clock;float[2] values;bool flag;char[4] label;",
+        )
+        updated = PX4ULog.read_topic(ulog, "root", 0, index)
+        @test updated.branches_leaves_clock == topic.branches_leaves_timestamp
+        @test !haskey(updated.cols, :branches_leaves_timestamp)
+
+        # Bad sizes and corrupt offsets fail before any field load. Cover both readers
+        # and both missing and extra bytes, without accepting arbitrary final padding.
+        for malformed in (payload[1:end-1], [payload; 0xaa])
+            bad_path = write_log(joinpath(dir, "bad.ulg"),
+                [records[1:4]; [('D', malformed)]])
+            @test_throws ErrorException PX4ULog.read_topic(bad_path, "root")
+            @test_throws ErrorException PX4ULog.read_topic(PX4ULog.ULog(bad_path), "root")
+        end
+        @test_throws ErrorException PX4ULog.read_topic(
+            ulog, "root", 0, Dict(UInt16(0) => Int64[16]),
+        )
+        @test_throws ErrorException PX4ULog.read_topic(ulog, "absent")
+        @test_throws ErrorException PX4ULog.read_topic(path, "absent")
+
+        # Flattened names cannot silently alias another field's output storage.
+        duplicate = write_log(joinpath(dir, "duplicate.ulg"), [
+            ('F', format_payload("root:leaf child;uint8_t child_value;")),
+            ('F', format_payload("leaf:uint8_t value;")),
+            ('A', add_subscription_payload(0x00, UInt16(0), "root")),
+        ])
+        @test_throws ErrorException PX4ULog.read_topic(duplicate, "root")
+        @test_throws ErrorException PX4ULog.read_topic(PX4ULog.ULog(duplicate), "root")
+
+    end
+
+    # Numeric decoding has no output strings to allocate. Use row indices beyond
+    # Julia's small-integer box cache so the allocation guard detects dispatch boxing.
+    fmt = PX4ULog.parse_format_string("numeric:uint64_t timestamp;float[3] xyz;bool ok;")
+    formats = Dict("numeric" => fmt)
+    cols, ts = PX4ULog.init_columns_prealloc(fmt, formats, 10_000)
+    plan = PX4ULog.build_decode_plan(fmt, formats, ts, cols)
+    payload = data_payload(UInt16(0), UInt64(42), 1.0f0, -0.0f0, NaN32, true)
+    decode_repeated!(plan, payload, 10_000)
+    small = @allocated decode_repeated!(plan, payload, 1000)
+    large = @allocated decode_repeated!(plan, payload, 10_000)
+    @test large <= small + 1024
+    @test ts == fill(UInt64(42), 10_000)
+    @test isequal(cols[:xyz][end, :], Float32[1, -0.0, NaN])
+
+end
